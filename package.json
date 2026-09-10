@@ -1,0 +1,37 @@
+{
+	"name": "pi-notify",
+	"version": "0.1.0",
+	"description": "Send Pi agent hook events to Telegram chats using a bot token and a list of chat ids.",
+	"license": "MIT",
+	"type": "module",
+	"keywords": [
+		"pi-package",
+		"pi",
+		"pi-coding-agent",
+		"telegram",
+		"notifications",
+		"hooks",
+		"gentle-ai"
+	],
+	"files": [
+		"extensions/",
+		"lib/",
+		"README.md"
+	],
+	"scripts": {
+		"test": "node --experimental-strip-types --test tests/*.test.ts"
+	},
+	"pi": {
+		"extensions": [
+			"./extensions"
+		]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": ">=0.85.1"
+	},
+	"peerDependenciesMeta": {
+		"@earendil-works/pi-coding-agent": {
+			"optional": true
+		}
+	}
+}
