@@ -1,7 +1,7 @@
 {
 	"name": "pi-notify",
 	"version": "0.1.0",
-	"description": "Send Pi agent hook events to Telegram chats using a bot token and a list of chat ids.",
+	"description": "Desktop system notifications (audio, banners, bell, custom commands) and Telegram alerts for Pi agent events.",
 	"license": "MIT",
 	"type": "module",
 	"keywords": [
@@ -10,12 +10,17 @@
 		"pi-coding-agent",
 		"telegram",
 		"notifications",
+		"desktop-notifications",
+		"sound",
+		"bell",
 		"hooks",
 		"gentle-ai"
 	],
 	"files": [
 		"extensions/",
 		"lib/",
+		"sounds/",
+		"NOTICE",
 		"README.md"
 	],
 	"scripts": {

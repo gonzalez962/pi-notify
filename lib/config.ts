@@ -198,3 +198,24 @@ export function validateForSend(config: NotifyConfig, token: string): ConfigProb
 	if (config.events.length === 0) problems.push({ field: "events", message: "no events selected" });
 	return problems;
 }
+
+export {
+	type SystemConfig,
+	type SystemEventType,
+	type EventActionConfig,
+	type CommandConfig,
+	type LinuxConfig,
+	type WindowsConfig,
+	type MessageContext,
+	DEFAULT_SYSTEM_CONFIG,
+	systemConfigPath,
+	systemStatePath,
+	loadSystemConfig,
+	saveSystemConfig,
+	loadTurnCount,
+	saveTurnCount,
+	incrementTurnCount,
+	normalizeSystemConfig,
+	interpolateMessage,
+	formatTimestamp,
+} from "./system-config.ts";
