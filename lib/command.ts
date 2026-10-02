@@ -1,6 +1,68 @@
 import { WORKSPACE_NAME_MAX_CODE_UNITS } from "./config.ts";
 import { ATTENTION_EVENTS, SUPPORTED_EVENTS, isSupportedEvent } from "./events.ts";
 
+export type ParsedNotifyCommand =
+	| { kind: "help" }
+	| { kind: "status" }
+	| { kind: "enable-all" }
+	| { kind: "disable-all" }
+	| { kind: "system-enable" }
+	| { kind: "system-disable" }
+	| { kind: "telegram-enable" }
+	| { kind: "telegram-disable" }
+	| { kind: "test"; message?: string }
+	| { kind: "error"; message: string };
+
+export const NOTIFY_HELP_TEXT = [
+	"/notify — control Pi notifications across System and Telegram channels",
+	"",
+	"  status                    show status for System and Telegram",
+	"  system on | off           enable or disable system (desktop/sound/bell) alerts",
+	"  telegram on | off         enable or disable Telegram notifications",
+	"  on | off                  enable or disable all channels",
+	"  test [message]            send a test notification across active channels",
+	"  help                      show this help message",
+	"",
+	"Use /telegram for Telegram bot token, chat ids, and formatting settings.",
+].join("\n");
+
+export function parseNotifyCommand(args: string): ParsedNotifyCommand {
+	const tokens = args.trim().split(/\s+/).filter((token) => token.length > 0);
+	if (tokens.length === 0) return { kind: "status" };
+
+	const [verb, ...rest] = tokens;
+	switch (verb) {
+		case "help":
+		case "-h":
+		case "--help":
+			return { kind: "help" };
+		case "status":
+			return { kind: "status" };
+		case "on":
+		case "enable":
+			return { kind: "enable-all" };
+		case "off":
+		case "disable":
+			return { kind: "disable-all" };
+		case "system": {
+			const action = rest[0];
+			if (action === "on" || action === "enable") return { kind: "system-enable" };
+			if (action === "off" || action === "disable") return { kind: "system-disable" };
+			return { kind: "error", message: "usage: /notify system on|off" };
+		}
+		case "telegram": {
+			const action = rest[0];
+			if (action === "on" || action === "enable") return { kind: "telegram-enable" };
+			if (action === "off" || action === "disable") return { kind: "telegram-disable" };
+			return { kind: "error", message: "usage: /notify telegram on|off" };
+		}
+		case "test":
+			return { kind: "test", message: rest.join(" ").trim() || undefined };
+		default:
+			return { kind: "error", message: `unknown subcommand: ${verb} — run /notify help` };
+	}
+}
+
 export type ParsedCommand =
 	| { kind: "help" }
 	| { kind: "status" }

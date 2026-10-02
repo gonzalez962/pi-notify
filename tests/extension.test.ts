@@ -7,6 +7,7 @@ import { DEFAULT_CONFIG, saveConfig } from "../lib/config.ts";
 
 const root = mkdtempSync(join(tmpdir(), "pi-notify-ext-"));
 process.env.PI_NOTIFY_CONFIG_HOME = root;
+process.env.PI_NOTIFY_DISABLE_SYSTEM_SPAWN = "1";
 delete process.env.PI_NOTIFY_TELEGRAM_BOT_TOKEN;
 delete process.env.TELEGRAM_BOT_TOKEN;
 
