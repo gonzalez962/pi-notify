@@ -45,10 +45,18 @@ describe("system-notify", () => {
 		assert.ok(args.includes("42"));
 	});
 
-	it("builds safe powershell script for windows balloon notifications", () => {
-		const script = buildWindowsNotificationScript("Title's test", "Message's body");
+	it("builds safe powershell script for windows notifications with WinRT toast and balloon fallback", () => {
+		const script = buildWindowsNotificationScript("Title's test", "Message's body", {
+			appName: "CustomAppId",
+			iconPath: "C:\\icons\\logo.png",
+		});
 		assert.ok(script.includes("Title''s test"));
 		assert.ok(script.includes("Message''s body"));
+		assert.ok(script.includes("ToastNotificationManager"));
+		assert.ok(script.includes("ToastGeneric"));
+		assert.ok(script.includes("audio silent=''true''") || script.includes("audio silent='true'"));
+		assert.ok(script.includes("CustomAppId"));
+		assert.ok(script.includes("appLogoOverride"));
 		assert.ok(script.includes("ShowBalloonTip"));
 	});
 

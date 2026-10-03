@@ -10,6 +10,12 @@ export type ParsedNotifyCommand =
 	| { kind: "system-disable" }
 	| { kind: "telegram-enable" }
 	| { kind: "telegram-disable" }
+	| { kind: "focus-enable" }
+	| { kind: "focus-disable" }
+	| { kind: "sound-enable" }
+	| { kind: "sound-disable" }
+	| { kind: "herdr-name-enable" }
+	| { kind: "herdr-name-disable" }
 	| { kind: "test"; message?: string }
 	| { kind: "error"; message: string };
 
@@ -19,6 +25,9 @@ export const NOTIFY_HELP_TEXT = [
 	"  status                    show status for System and Telegram",
 	"  system on | off           enable or disable system (desktop/sound/bell) alerts",
 	"  telegram on | off         enable or disable Telegram notifications",
+	"  sound on | off            enable or disable system sound effects",
+	"  focus on | off            toggle suppression when terminal is focused",
+	"  herdr-name on | off       show or hide agent prefix ('pi ') in Herdr pane",
 	"  on | off                  enable or disable all channels",
 	"  test [message]            send a test notification across active channels",
 	"  help                      show this help message",
@@ -48,6 +57,18 @@ export function parseNotifyCommand(args: string): ParsedNotifyCommand {
 			const action = rest[0];
 			if (action === "on" || action === "enable") return { kind: "system-enable" };
 			if (action === "off" || action === "disable") return { kind: "system-disable" };
+			if (action === "focus") {
+				const sub = rest[1];
+				if (sub === "on" || sub === "enable") return { kind: "focus-enable" };
+				if (sub === "off" || sub === "disable") return { kind: "focus-disable" };
+				return { kind: "error", message: "usage: /notify system focus on|off" };
+			}
+			if (action === "sound") {
+				const sub = rest[1];
+				if (sub === "on" || sub === "enable") return { kind: "sound-enable" };
+				if (sub === "off" || sub === "disable") return { kind: "sound-disable" };
+				return { kind: "error", message: "usage: /notify system sound on|off" };
+			}
 			return { kind: "error", message: "usage: /notify system on|off" };
 		}
 		case "telegram": {
@@ -55,6 +76,25 @@ export function parseNotifyCommand(args: string): ParsedNotifyCommand {
 			if (action === "on" || action === "enable") return { kind: "telegram-enable" };
 			if (action === "off" || action === "disable") return { kind: "telegram-disable" };
 			return { kind: "error", message: "usage: /notify telegram on|off" };
+		}
+		case "focus": {
+			const action = rest[0];
+			if (action === "on" || action === "enable") return { kind: "focus-enable" };
+			if (action === "off" || action === "disable") return { kind: "focus-disable" };
+			return { kind: "error", message: "usage: /notify focus on|off" };
+		}
+		case "sound": {
+			const action = rest[0];
+			if (action === "on" || action === "enable") return { kind: "sound-enable" };
+			if (action === "off" || action === "disable") return { kind: "sound-disable" };
+			return { kind: "error", message: "usage: /notify sound on|off" };
+		}
+		case "herdr-name":
+		case "herdr": {
+			const action = rest[0] === "name" ? rest[1] : rest[0];
+			if (action === "on" || action === "enable") return { kind: "herdr-name-enable" };
+			if (action === "off" || action === "disable") return { kind: "herdr-name-disable" };
+			return { kind: "error", message: "usage: /notify herdr-name on|off" };
 		}
 		case "test":
 			return { kind: "test", message: rest.join(" ").trim() || undefined };

@@ -274,4 +274,50 @@ describe("channel isolation and edge cases", () => {
 		// Ensure complete sound was not triggered
 		assert.equal(systemSounds.some((s) => s.ev === "complete"), false);
 	});
+
+	it("dispatches subagent_complete alert on message_end with gentle-agents.result", async () => {
+		saveSystemConfig({
+			...DEFAULT_SYSTEM_CONFIG,
+			enabled: true,
+			events: {
+				...DEFAULT_SYSTEM_CONFIG.events,
+				subagent_complete: { sound: true, notification: true, command: false, bell: false },
+			},
+		});
+
+		const pi = fakePi();
+		register(pi);
+
+		await pi.emit("message_end", {
+			message: {
+				customType: "gentle-agents.result",
+				details: { gentleAgents: { taskId: "task_1" } },
+			},
+		}, ctx);
+
+		assert.equal(systemNotifications.length, 1);
+		assert.ok(systemNotifications[0].message.includes("Subagent task completed"));
+		assert.equal(systemSounds.length, 1);
+		assert.equal(systemSounds[0].ev, "subagent_complete");
+	});
+
+	it("bypasses focus suppression when running /notify test", async () => {
+		saveConfig({ ...DEFAULT_CONFIG, enabled: false });
+		saveSystemConfig({
+			...DEFAULT_SYSTEM_CONFIG,
+			enabled: true,
+			suppressWhenFocused: true,
+		});
+
+		terminalFocused = true; // Terminal is focused
+
+		const pi = fakePi();
+		register(pi);
+
+		const notifyCmd = pi.commands.get("notify")!;
+		await notifyCmd.handler("test Hello", ctx);
+
+		assert.equal(systemNotifications.length, 1);
+		assert.equal(systemSounds.length, 1);
+	});
 });

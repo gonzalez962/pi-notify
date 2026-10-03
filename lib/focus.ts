@@ -19,6 +19,7 @@ const LINUX_TERMINAL_APPS = new Set<string>([
 	"deepin-terminal",
 	"foot",
 	"footclient",
+	"herdr",
 ]);
 
 const MAC_TERMINAL_APPS = new Set<string>([
@@ -37,6 +38,7 @@ const MAC_TERMINAL_APPS = new Set<string>([
 	"code insiders",
 	"zed",
 	"rio",
+	"herdr",
 ]);
 
 export function execWithTimeout(
@@ -140,20 +142,29 @@ export function isTerminalFocused(options: {
 
 	try {
 		const herdr = isHerdrActivePane(env, exec);
-		if (herdr !== null) return herdr;
+		if (herdr === false) return false;
 
 		const wez = isWezTermActivePane(env, exec);
-		if (wez !== null) return wez;
+		if (wez === false) return false;
 
 		const tmux = isTmuxActivePane(env, exec);
-		if (tmux !== null) return tmux;
+		if (tmux === false) return false;
 
 		if (plat === "darwin") {
 			const script = 'tell application "System Events" to get name of first application process whose frontmost is true';
 			const out = execF("osascript", ["-e", script], 600);
 			if (!out) return false;
 			const name = out.trim().toLowerCase();
-			return MAC_TERMINAL_APPS.has(name);
+			if (MAC_TERMINAL_APPS.has(name)) {
+				if ((name === "code" || name === "visual studio code" || name === "code insiders") && env.TERM_PROGRAM !== "vscode") {
+					return false;
+				}
+				if (name === "cursor" && env.TERM_PROGRAM !== "cursor") {
+					return false;
+				}
+				return true;
+			}
+			return false;
 		}
 
 		if (plat === "linux") {
@@ -202,23 +213,33 @@ export function isTerminalFocused(options: {
 
 		if (plat === "win32") {
 			const script = [
-				"Add-Type @'",
+				"Add-Type -TypeDefinition @'",
 				"using System;",
 				"using System.Runtime.InteropServices;",
 				"public class WinFocus {",
-				"  [DllImport(\"user32.dll\")] public static extern IntPtr GetForegroundWindow();",
-				"  [DllImport(\"user32.dll\")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);",
+				'  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();',
+				'  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);',
 				"}",
 				"'@;",
 				"$hwnd = [WinFocus]::GetForegroundWindow();",
 				"$procId = 0;",
-				"[WinFocus]::GetWindowThreadProcessId($hwnd, [ref]$procId);",
-				"(Get-Process -Id $procId).ProcessName",
-			].join(" ");
-			const out = execF("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], 800);
+				"$null = [WinFocus]::GetWindowThreadProcessId($hwnd, [ref]$procId);",
+				"if ($procId -gt 0) { (Get-Process -Id $procId -ErrorAction SilentlyContinue).ProcessName }",
+			].join("\n");
+			const out = execF("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], 1500);
 			if (!out) return false;
 			const proc = out.trim().toLowerCase();
-			const winTerminals = new Set(["windowsterminal", "cmd", "powershell", "pwsh", "alacritty", "wezterm-gui", "code", "cursor", "herdr"]);
+			const winTerminals = new Set([
+				"windowsterminal",
+				"cmd",
+				"powershell",
+				"pwsh",
+				"alacritty",
+				"wezterm-gui",
+				"herdr",
+			]);
+			if (env.TERM_PROGRAM === "vscode") winTerminals.add("code");
+			if (env.TERM_PROGRAM === "cursor") winTerminals.add("cursor");
 			return winTerminals.has(proc);
 		}
 

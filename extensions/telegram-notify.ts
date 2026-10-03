@@ -69,9 +69,11 @@ export function resetSystemDrivers(): void {
 }
 
 export default function telegramNotify(pi: ExtensionAPI): void {
-	const herdrTracker = initHerdrTracker(pi);
 	let config: NotifyConfig = loadConfig();
 	let systemConfig: SystemConfig = loadSystemConfig();
+	const herdrTracker = initHerdrTracker(pi, {
+		showAgentPrefix: systemConfig.herdr.showAgentName,
+	});
 	const lastSentAt = new Map<string, number>();
 	const inFlight = new Set<Promise<unknown>>();
 	/** Last assistant answer seen, so `agent_settled` can carry the actual reply. */
@@ -83,6 +85,7 @@ export default function telegramNotify(pi: ExtensionAPI): void {
 	function reload(): void {
 		config = loadConfig();
 		systemConfig = loadSystemConfig();
+		herdrTracker?.setShowAgentPrefix(systemConfig.herdr.showAgentName);
 	}
 
 	function persist(next: NotifyConfig): void {
@@ -93,6 +96,7 @@ export default function telegramNotify(pi: ExtensionAPI): void {
 	function persistSystem(next: SystemConfig): void {
 		saveSystemConfig(next);
 		systemConfig = loadSystemConfig();
+		herdrTracker?.setShowAgentPrefix(systemConfig.herdr.showAgentName);
 	}
 
 	function sessionName(): string | undefined {
@@ -178,6 +182,7 @@ export default function telegramNotify(pi: ExtensionAPI): void {
 		eventType: SystemEventType,
 		_eventData: unknown,
 		ctx?: ExtensionContext,
+		options: { bypassFocus?: boolean } = {},
 	): Promise<void> {
 		if (!systemConfig.enabled) return;
 
@@ -213,6 +218,7 @@ export default function telegramNotify(pi: ExtensionAPI): void {
 		}
 
 		const isFocused =
+			!options.bypassFocus &&
 			systemConfig.suppressWhenFocused &&
 			(activeDrivers.isFocused ? activeDrivers.isFocused() : isTerminalFocused());
 
@@ -283,6 +289,14 @@ export default function telegramNotify(pi: ExtensionAPI): void {
 		}
 		const answer = lastAssistantText(messages);
 		if (answer.length > 0) lastAnswer = answer;
+		return undefined;
+	});
+
+	pi.on("message_end", (event: unknown, ctx: ExtensionContext) => {
+		const msg = (event as { message?: any } | undefined)?.message;
+		if (msg?.customType === "gentle-agents.result") {
+			track(dispatchSystemEvent("subagent_complete", event, ctx).catch(() => undefined));
+		}
 		return undefined;
 	});
 
@@ -396,6 +410,7 @@ export default function telegramNotify(pi: ExtensionAPI): void {
 			"",
 			"Herdr channel:",
 			`  active:              ${isHerdrActive() ? `yes (pane ${process.env.HERDR_PANE_ID})` : "no (not in Herdr)"}`,
+			`  showAgentName:       ${systemConfig.herdr.showAgentName}`,
 			"",
 			"Telegram channel:",
 			`  enabled:             ${config.enabled}`,
@@ -446,7 +461,7 @@ export default function telegramNotify(pi: ExtensionAPI): void {
 			const trimmed = prefix.trimStart();
 			if (trimmed.startsWith("system ")) {
 				const sub = trimmed.slice(7);
-				const verbs = ["on", "off"].filter((v) => v.startsWith(sub));
+				const verbs = ["on", "off", "focus", "sound"].filter((v) => v.startsWith(sub));
 				return verbs.map((v) => ({ value: `system ${v}`, label: `system ${v}` }));
 			}
 			if (trimmed.startsWith("telegram ")) {
@@ -454,7 +469,22 @@ export default function telegramNotify(pi: ExtensionAPI): void {
 				const verbs = ["on", "off"].filter((v) => v.startsWith(sub));
 				return verbs.map((v) => ({ value: `telegram ${v}`, label: `telegram ${v}` }));
 			}
-			const verbs = ["status", "system", "telegram", "on", "off", "test", "help"];
+			if (trimmed.startsWith("focus ")) {
+				const sub = trimmed.slice(6);
+				const verbs = ["on", "off"].filter((v) => v.startsWith(sub));
+				return verbs.map((v) => ({ value: `focus ${v}`, label: `focus ${v}` }));
+			}
+			if (trimmed.startsWith("sound ")) {
+				const sub = trimmed.slice(6);
+				const verbs = ["on", "off"].filter((v) => v.startsWith(sub));
+				return verbs.map((v) => ({ value: `sound ${v}`, label: `sound ${v}` }));
+			}
+			if (trimmed.startsWith("herdr-name ") || trimmed.startsWith("herdr ")) {
+				const sub = trimmed.startsWith("herdr ") ? trimmed.slice(6) : trimmed.slice(11);
+				const verbs = ["on", "off"].filter((v) => v.startsWith(sub));
+				return verbs.map((v) => ({ value: `herdr-name ${v}`, label: `herdr-name ${v}` }));
+			}
+			const verbs = ["status", "system", "telegram", "sound", "focus", "herdr-name", "on", "off", "test", "help"];
 			const items = verbs.filter((v) => v.startsWith(trimmed)).map((v) => ({ value: v, label: v }));
 			return items.length > 0 ? items : null;
 		},
@@ -483,6 +513,33 @@ export default function telegramNotify(pi: ExtensionAPI): void {
 					ctx.ui.notify(`Telegram notifications ${enabled ? "enabled" : "disabled"}.`, "info");
 					return;
 				}
+				case "focus-enable":
+				case "focus-disable": {
+					const suppressWhenFocused = parsed.kind === "focus-enable";
+					persistSystem({ ...systemConfig, suppressWhenFocused });
+					ctx.ui.notify(
+						`Focus suppression ${suppressWhenFocused ? "enabled (silent when focused)" : "disabled (alerts always fire)"}.`,
+						"info",
+					);
+					return;
+				}
+				case "sound-enable":
+				case "sound-disable": {
+					const sound = parsed.kind === "sound-enable";
+					persistSystem({ ...systemConfig, sound });
+					ctx.ui.notify(`System sound ${sound ? "enabled" : "disabled"}.`, "info");
+					return;
+				}
+				case "herdr-name-enable":
+				case "herdr-name-disable": {
+					const showAgentName = parsed.kind === "herdr-name-enable";
+					persistSystem({ ...systemConfig, herdr: { ...systemConfig.herdr, showAgentName } });
+					ctx.ui.notify(
+						`Herdr agent prefix ${showAgentName ? "enabled ('pi [...]')" : "disabled ('[...]')"}.`,
+						"info",
+					);
+					return;
+				}
 				case "enable-all": {
 					persistSystem({ ...systemConfig, enabled: true });
 					persist({ ...config, enabled: true });
@@ -500,7 +557,7 @@ export default function telegramNotify(pi: ExtensionAPI): void {
 					const notes: string[] = [];
 
 					if (systemConfig.enabled) {
-						await dispatchSystemEvent("complete", { test: true }, ctx);
+						await dispatchSystemEvent("complete", { test: true }, ctx, { bypassFocus: true });
 						notes.push("System alert triggered.");
 					} else {
 						notes.push("System channel is disabled.");

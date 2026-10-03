@@ -21,11 +21,39 @@ export interface TrackedSubagent {
 	mode?: string;
 }
 
+const ODD_PHASE_REGISTRY = Symbol.for("gentle-pi.odd-phase-registry");
+
+export function getGentleOddPhase(sessionId?: string): string | undefined {
+	try {
+		const registry = (globalThis as any)[ODD_PHASE_REGISTRY];
+		if (!registry) return undefined;
+		if (sessionId && typeof registry.get === "function") {
+			const phase = registry.get(sessionId);
+			if (phase) return phase;
+		}
+		if (typeof registry.phases?.get === "function" && sessionId) {
+			const entry = registry.phases.get(sessionId);
+			if (entry?.phase) return entry.phase;
+		}
+		if (typeof registry.phases?.values === "function") {
+			const entries = Array.from(registry.phases.values()) as any[];
+			if (entries.length > 0) {
+				const last = entries[entries.length - 1];
+				if (last?.phase) return last.phase;
+			}
+		}
+		return undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 export interface HerdrTrackerOptions {
 	env?: NodeJS.ProcessEnv;
 	platform?: string;
 	writeStdout?: (chunk: string) => void;
 	sendRequest?: (endpoint: string, request: unknown, timeoutMs?: number) => Promise<boolean>;
+	showAgentPrefix?: boolean;
 }
 
 export function isHerdrActive(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -73,13 +101,17 @@ export class HerdrTracker {
 	private platform: string;
 	private writeStdout: (chunk: string) => void;
 	private sendRequestFn: (endpoint: string, request: unknown, timeoutMs?: number) => Promise<boolean>;
+	private showAgentPrefix: boolean;
 
 	private isDisposed = false;
 	private isMainAgentWorking = false;
 	private currentToolName: string | null = null;
+	private currentActivityNotice: string | null = null;
+	private activeToolCalls = new Map<string, string>();
 	private activeSubagents = new Map<string, TrackedSubagent>();
-	private blockedCount = 0;
-	private blockedMessage: string | undefined;
+	private activeBlockers = new Set<string>();
+	private activeBlockerMessages = new Map<string, string>();
+	private currentSessionId: string | undefined;
 	private lastFatalError = false;
 	private hasRunTask = false;
 	private retryTimers: NodeJS.Timeout[] = [];
@@ -102,6 +134,7 @@ export class HerdrTracker {
 		| undefined;
 
 	private getSessionNameFn?: () => string | undefined;
+	private getSessionIdFn?: () => string | undefined;
 
 	constructor(options: HerdrTrackerOptions = {}) {
 		this.env = options.env ?? process.env;
@@ -112,10 +145,66 @@ export class HerdrTracker {
 			} catch {}
 		});
 		this.sendRequestFn = options.sendRequest ?? sendHerdrRequestDefault;
+		this.showAgentPrefix = options.showAgentPrefix ?? true;
+	}
+
+	public setShowAgentPrefix(val: boolean): void {
+		this.showAgentPrefix = val;
+		this.publishState(true);
+	}
+
+	private formatDisplayAgent(status: string): string {
+		return this.showAgentPrefix ? `pi ${status}` : status;
 	}
 
 	public setSessionNameAccessor(fn: () => string | undefined): void {
 		this.getSessionNameFn = fn;
+	}
+
+	public setSessionIdAccessor(fn: () => string | undefined): void {
+		this.getSessionIdFn = fn;
+	}
+
+	public getActiveSessionId(): string | undefined {
+		try {
+			const id = this.getSessionIdFn?.();
+			if (id) return id;
+		} catch {}
+		if (this.currentSessionId) return this.currentSessionId;
+		if (this.env.PI_SESSION_ID) return this.env.PI_SESSION_ID;
+		if (process.env.PI_SESSION_ID) return process.env.PI_SESSION_ID;
+		return undefined;
+	}
+
+	public get blockedCount(): number {
+		return this.activeBlockers.size;
+	}
+
+	public set blockedCount(val: number) {
+		if (val <= 0) {
+			this.activeBlockers.clear();
+			this.activeBlockerMessages.clear();
+		} else {
+			this.activeBlockers.add("legacy");
+		}
+	}
+
+	public get blockedMessage(): string | undefined {
+		return (
+			this.activeBlockerMessages.get("herdr") ||
+			this.activeBlockerMessages.get("choice") ||
+			this.activeBlockerMessages.get("question") ||
+			this.activeBlockerMessages.get("ui_prompt") ||
+			this.activeBlockerMessages.get("legacy")
+		);
+	}
+
+	public set blockedMessage(val: string | undefined) {
+		if (val) {
+			this.activeBlockerMessages.set("legacy", val);
+		} else {
+			this.activeBlockerMessages.delete("legacy");
+		}
 	}
 
 	public isHerdrEnvironment(): boolean {
@@ -137,30 +226,58 @@ export class HerdrTracker {
 		);
 	}
 
+	public isBlocked(): boolean {
+		if (this.activeBlockers.size === 0) return false;
+		// If main agent is actively working with a non-interactive tool (e.g. read, grep, bash, edit),
+		// it is executing work and cannot be blocked waiting for human input.
+		if (
+			this.isMainAgentWorking &&
+			this.currentToolName &&
+			this.currentToolName !== "ask_user_choice" &&
+			this.currentToolName !== "ask_user_question"
+		) {
+			return false;
+		}
+		return true;
+	}
+
 	public getDesiredState(): {
 		state: HerdrAgentState;
 		message?: string;
 		displayAgent?: string;
 	} {
 		const waitingSub = this.getWaitingSubagent();
-		if (this.blockedCount > 0 || waitingSub) {
+		const blocked = this.isBlocked();
+
+		if (blocked || waitingSub) {
+			const blockerMsg = this.blockedMessage;
 			const msg =
-				this.blockedMessage ??
+				blockerMsg ??
 				(waitingSub ? `${waitingSub.agent}: esperando respuesta` : "esperando respuesta");
-			const display = waitingSub
-				? `pi [❓ ${waitingSub.agent}: esperando]`
-				: "pi [❓ esperando respuesta]";
-			return { state: "blocked", message: msg, displayAgent: display };
+			const displayStatus = waitingSub
+				? `[❓ ${waitingSub.agent}: esperando]`
+				: (blockerMsg ? `[❓ ${blockerMsg}]` : "[❓ esperando respuesta]");
+			return { state: "blocked", message: msg, displayAgent: this.formatDisplayAgent(displayStatus) };
 		}
 
 		const hasSub = this.activeSubagents.size > 0;
 		if (this.isMainAgentWorking || hasSub) {
 			let desc: string;
 			let display: string;
-			if (this.isMainAgentWorking && this.currentToolName) {
+			const oddPhase = getGentleOddPhase(this.getActiveSessionId());
+			if (this.currentActivityNotice) {
+				const suffix = hasSub ? ` (+${this.activeSubagents.size} sub)` : "";
+				desc = `[${this.currentActivityNotice}${suffix}]`;
+				display = this.formatDisplayAgent(`[⏳ ${this.currentActivityNotice}${suffix}]`);
+			} else if (
+				this.isMainAgentWorking &&
+				this.currentToolName &&
+				this.currentToolName !== "subagent_run" &&
+				this.currentToolName !== "subagent"
+			) {
 				const suffix = hasSub ? ` (+${this.activeSubagents.size} sub)` : "";
 				desc = `[${this.currentToolName}${suffix}]`;
-				display = `pi [⏳ ${this.currentToolName}${suffix}]`;
+				display = this.formatDisplayAgent(`[⏳ ${this.currentToolName}${suffix}]`);
 			} else if (hasSub) {
 				if (this.activeSubagents.size === 1) {
 					const sub = Array.from(this.activeSubagents.values())[0]!;
@@ -172,7 +289,7 @@ export class HerdrTracker {
 							? `: ${sub.lastStep}`
 							: "";
 					desc = `[${sub.agent}${step}]`;
-					display = `pi [⏳ ${sub.agent}${step}]`;
+					display = this.formatDisplayAgent(`[⏳ ${sub.agent}${step}]`);
 				} else {
 					const names = Array.from(this.activeSubagents.values())
 						.map((s) => s.agent)
@@ -180,12 +297,19 @@ export class HerdrTracker {
 					const label =
 						this.activeSubagents.size <= 2 ? names : `${this.activeSubagents.size} subagentes`;
 					desc = `[${label}]`;
-					display = `pi [⏳ ${label}]`;
+					display = this.formatDisplayAgent(`[⏳ ${label}]`);
 				}
+			} else if (this.currentToolName) {
+				desc = `[${this.currentToolName}]`;
+				display = this.formatDisplayAgent(`[⏳ ${this.currentToolName}]`);
+			} else if (oddPhase && oddPhase !== "deciding") {
+				const suffix = hasSub ? ` (+${this.activeSubagents.size} sub)` : "";
+				desc = `[${oddPhase}${suffix}]`;
+				display = this.formatDisplayAgent(`[⏳ ${oddPhase}${suffix}]`);
 			} else {
 				const suffix = hasSub ? ` (+${this.activeSubagents.size} sub)` : "";
 				desc = `[pensando${suffix}]`;
-				display = `pi [⏳ pensando${suffix}]`;
+				display = this.formatDisplayAgent(`[⏳ pensando${suffix}]`);
 			}
 
 			return { state: "working", message: desc, displayAgent: display };
@@ -196,10 +320,10 @@ export class HerdrTracker {
 		}
 
 		if (this.lastFatalError) {
-			return { state: "idle", message: "[error]", displayAgent: "pi [❌ error]" };
+			return { state: "idle", message: "[error]", displayAgent: this.formatDisplayAgent("[❌ error]") };
 		}
 
-		return { state: "idle", message: undefined, displayAgent: "pi [✅ listo]" };
+		return { state: "idle", message: "[success]", displayAgent: this.formatDisplayAgent("[✅ success]") };
 	}
 
 	public getBaseTitle(): string {
@@ -466,68 +590,205 @@ export class HerdrTracker {
 			}
 		});
 
+		this.setSessionIdAccessor(() => {
+			try {
+				return typeof pi?.getSessionId === "function" ? pi.getSessionId() : undefined;
+			} catch {
+				return undefined;
+			}
+		});
+
 		if (pi.events?.on) {
 			pi.events.on("gentle-agents:activity", (data: unknown) => this.handleSubagentActivity(data));
 			pi.events.on("subagent:activity", (data: unknown) => this.handleSubagentActivity(data));
 			pi.events.on("herdr:blocked", (data: any) => {
 				if (!data?.active) {
-					this.blockedCount = Math.max(0, this.blockedCount - 1);
-					if (this.blockedCount === 0) this.blockedMessage = undefined;
+					this.activeBlockers.delete("herdr");
+					this.activeBlockerMessages.delete("herdr");
 					this.publishState();
 					return;
 				}
-				this.blockedCount += 1;
-				this.blockedMessage = data.label;
+				this.activeBlockers.add("herdr");
+				if (data.label) this.activeBlockerMessages.set("herdr", String(data.label));
+				this.publishState();
+			});
+			pi.events.on("gentle-pi:ask-user-choice:blocked", (data: any) => {
+				if (data?.active) {
+					this.activeBlockers.add("choice");
+					this.activeBlockerMessages.set("choice", "esperando selección");
+				} else {
+					this.activeBlockers.delete("choice");
+					this.activeBlockerMessages.delete("choice");
+				}
+				this.publishState();
+			});
+			pi.events.on("gentle-pi:ask-user-question:blocked", (data: any) => {
+				if (data?.active) {
+					this.activeBlockers.add("question");
+					this.activeBlockerMessages.set("question", "esperando respuesta");
+				} else {
+					this.activeBlockers.delete("question");
+					this.activeBlockerMessages.delete("question");
+				}
 				this.publishState();
 			});
 		}
+
+		const updateSessionFromCtx = (ctx: any) => {
+			const sid = ctx?.sessionManager?.getSessionId?.() ?? ctx?.sessionId;
+			if (sid) this.currentSessionId = sid;
+		};
 
 		pi.on("session_start", (_event: unknown, ctx: any) => {
 			this.isDisposed = false;
 			this.isMainAgentWorking = false;
 			this.currentToolName = null;
+			this.currentActivityNotice = null;
+			updateSessionFromCtx(ctx);
+			this.activeToolCalls.clear();
 			this.activeSubagents.clear();
-			this.blockedCount = 0;
-			this.blockedMessage = undefined;
+			this.activeBlockers.clear();
+			this.activeBlockerMessages.clear();
 			this.lastFatalError = false;
 			this.hasRunTask = false;
 			this.clearTimers();
 			this.publishState(true);
 		});
 
-		pi.on("agent_start", () => {
+		pi.on("before_agent_start", (_event: unknown, ctx: any) => {
+			updateSessionFromCtx(ctx);
 			this.hasRunTask = true;
 			this.isMainAgentWorking = true;
 			this.lastFatalError = false;
+			this.activeBlockers.clear();
+			this.activeBlockerMessages.clear();
 			this.clearTimers();
 			this.publishState();
 		});
 
-		pi.on("turn_start", () => {
+		pi.on("agent_start", (_event: unknown, ctx: any) => {
 			this.hasRunTask = true;
 			this.isMainAgentWorking = true;
+			this.lastFatalError = false;
+			updateSessionFromCtx(ctx);
+			this.activeBlockers.clear();
+			this.activeBlockerMessages.clear();
 			this.clearTimers();
 			this.publishState();
 		});
 
-		pi.on("tool_execution_start", (event: any) => {
-			this.currentToolName = event?.toolName ?? null;
+		pi.on("turn_start", (_event: unknown, ctx: any) => {
+			updateSessionFromCtx(ctx);
+			this.hasRunTask = true;
+			this.isMainAgentWorking = true;
+			this.activeBlockers.clear();
+			this.activeBlockerMessages.clear();
+			this.clearTimers();
 			this.publishState();
 		});
 
-		pi.on("tool_execution_end", (event: any) => {
-			this.currentToolName = null;
+		pi.on("user_bash", (_event: unknown, ctx: any) => {
+			updateSessionFromCtx(ctx);
+			this.hasRunTask = true;
+			this.isMainAgentWorking = true;
+			this.currentToolName = "bash";
+			this.activeBlockers.clear();
+			this.activeBlockerMessages.clear();
+			this.clearTimers();
+			this.publishState();
+		});
+
+		pi.on("input", (_event: unknown, ctx: any) => {
+			updateSessionFromCtx(ctx);
+			if (this.currentToolName === "bash" && this.activeToolCalls.size === 0) {
+				this.currentToolName = null;
+				this.isMainAgentWorking = false;
+				this.publishState();
+			}
+		});
+
+		pi.on("session_before_compact", () => {
+			this.isMainAgentWorking = true;
+			this.currentActivityNotice = "compactando contexto";
+			this.clearTimers();
+			this.publishState();
+		});
+
+		pi.on("session_compact", () => {
+			this.currentActivityNotice = null;
+			this.isMainAgentWorking = false;
+			this.publishState();
+		});
+
+		pi.on("session_compact_failed", () => {
+			this.currentActivityNotice = null;
+			this.isMainAgentWorking = false;
+			this.publishState();
+		});
+
+		pi.on("auto_retry_start", (event: any) => {
+			this.isMainAgentWorking = true;
+			const attempt = event?.attempt ? ` (${event.attempt}/${event.maxAttempts ?? "?"})` : "";
+			this.currentActivityNotice = `reintentando${attempt}`;
+			this.clearTimers();
+			this.publishState();
+		});
+
+		pi.on("auto_retry_end", () => {
+			this.currentActivityNotice = null;
+			this.isMainAgentWorking = false;
+			this.publishState();
+		});
+
+		pi.on("tool_execution_start", (event: any, ctx: any) => {
+			updateSessionFromCtx(ctx);
+			const toolCallId = String(
+				event?.toolCallId ?? (event?.toolName ? `call-${Date.now()}-${Math.random().toString(36).slice(2)}` : ""),
+			);
+			const toolName = event?.toolName ? String(event.toolName) : null;
+			if (toolName && toolCallId) {
+				this.activeToolCalls.set(toolCallId, toolName);
+			}
+			this.currentToolName = toolName;
+			if (toolName && toolName !== "ask_user_choice" && toolName !== "ask_user_question") {
+				this.activeBlockers.delete("ui_prompt");
+				this.activeBlockerMessages.delete("ui_prompt");
+			}
+			this.publishState();
+		});
+
+		pi.on("tool_execution_end", (event: any, ctx: any) => {
+			updateSessionFromCtx(ctx);
+			const toolCallId = String(event?.toolCallId ?? "");
+			if (toolCallId && this.activeToolCalls.has(toolCallId)) {
+				this.activeToolCalls.delete(toolCallId);
+			} else if (event?.toolName) {
+				for (const [id, name] of this.activeToolCalls) {
+					if (name === event.toolName) {
+						this.activeToolCalls.delete(id);
+						break;
+					}
+				}
+			}
+			if (this.activeToolCalls.size > 0) {
+				const remaining = Array.from(this.activeToolCalls.values());
+				this.currentToolName = remaining[remaining.length - 1] ?? null;
+			} else {
+				this.currentToolName = null;
+			}
 			if (event) this.handleToolExecutionEnd(event);
 			this.publishState();
 		});
 
 		pi.on("ui_prompt_start", () => {
-			this.blockedCount += 1;
+			this.activeBlockers.add("ui_prompt");
+			this.activeBlockerMessages.set("ui_prompt", "esperando respuesta");
 			this.publishState();
 		});
 
 		pi.on("ui_prompt_end", () => {
-			this.blockedCount = Math.max(0, this.blockedCount - 1);
+			this.activeBlockers.delete("ui_prompt");
+			this.activeBlockerMessages.delete("ui_prompt");
 			this.publishState();
 		});
 
@@ -537,8 +798,11 @@ export class HerdrTracker {
 				const taskId = msg?.details?.gentleAgents?.taskId;
 				if (taskId && this.activeSubagents.has(taskId)) {
 					this.activeSubagents.delete(taskId);
-					this.publishState();
 				}
+				this.hasRunTask = true;
+				this.isMainAgentWorking = true;
+				this.clearTimers();
+				this.publishState();
 			}
 		});
 
@@ -554,9 +818,14 @@ export class HerdrTracker {
 		});
 
 		pi.on("agent_settled", (_event: unknown, ctx: any) => {
+			updateSessionFromCtx(ctx);
 			if (ctx?.isIdle?.() !== true && typeof ctx?.isIdle === "function") return;
 			this.isMainAgentWorking = false;
 			this.currentToolName = null;
+			this.currentActivityNotice = null;
+			this.activeToolCalls.clear();
+			this.activeBlockers.clear();
+			this.activeBlockerMessages.clear();
 			this.publishState();
 		});
 
@@ -569,7 +838,11 @@ export class HerdrTracker {
 		this.isDisposed = true;
 		this.isMainAgentWorking = false;
 		this.currentToolName = null;
+		this.currentActivityNotice = null;
+		this.activeToolCalls.clear();
 		this.activeSubagents.clear();
+		this.activeBlockers.clear();
+		this.activeBlockerMessages.clear();
 		this.clearTimers();
 		this.emitTerminalTitle(undefined, "idle");
 		if (this.isHerdrEnvironment() && this.lastReportedDisplayAgent) {

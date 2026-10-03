@@ -49,6 +49,10 @@ export interface WindowsConfig {
 	appID: string;
 }
 
+export interface HerdrConfig {
+	showAgentName: boolean;
+}
+
 export interface SystemConfig {
 	/** Master switch for system alerts (desktop notification, sound, bell, command). */
 	enabled: boolean;
@@ -67,6 +71,7 @@ export interface SystemConfig {
 	suppressGhosttySound: boolean;
 	linux: LinuxConfig;
 	windows: WindowsConfig;
+	herdr: HerdrConfig;
 	minDuration: number;
 	mainAgentOnly: boolean;
 	command: CommandConfig;
@@ -103,6 +108,9 @@ export const DEFAULT_SYSTEM_CONFIG: SystemConfig = {
 	},
 	windows: {
 		appID: "pi",
+	},
+	herdr: {
+		showAgentName: false,
 	},
 	minDuration: 0,
 	mainAgentOnly: true,
@@ -314,6 +322,11 @@ export function normalizeSystemConfig(raw: unknown): SystemConfig {
 		appID: normalizeString(rawWindows.appID, base.windows.appID),
 	};
 
+	const rawHerdr = (typeof r.herdr === "object" && r.herdr !== null ? r.herdr : {}) as Record<string, unknown>;
+	const herdr: HerdrConfig = {
+		showAgentName: normalizeBoolean(rawHerdr.showAgentName, base.herdr.showAgentName),
+	};
+
 	return {
 		enabled: normalizeBoolean(r.enabled, base.enabled),
 		sound: normalizeBoolean(r.sound, base.sound),
@@ -331,6 +344,7 @@ export function normalizeSystemConfig(raw: unknown): SystemConfig {
 		suppressGhosttySound: normalizeBoolean(r.suppressGhosttySound, base.suppressGhosttySound),
 		linux,
 		windows,
+		herdr,
 		minDuration: normalizeNumber(r.minDuration, base.minDuration, 0, 86400),
 		mainAgentOnly: normalizeBoolean(r.mainAgentOnly, base.mainAgentOnly),
 		command,

@@ -49,8 +49,20 @@ describe("notify command", () => {
 		assert.deepEqual(parseNotifyCommand("system off"), { kind: "system-disable" });
 		assert.deepEqual(parseNotifyCommand("telegram on"), { kind: "telegram-enable" });
 		assert.deepEqual(parseNotifyCommand("telegram off"), { kind: "telegram-disable" });
+		assert.deepEqual(parseNotifyCommand("focus on"), { kind: "focus-enable" });
+		assert.deepEqual(parseNotifyCommand("focus off"), { kind: "focus-disable" });
+		assert.deepEqual(parseNotifyCommand("sound on"), { kind: "sound-enable" });
+		assert.deepEqual(parseNotifyCommand("sound off"), { kind: "sound-disable" });
+		assert.deepEqual(parseNotifyCommand("herdr-name on"), { kind: "herdr-name-enable" });
+		assert.deepEqual(parseNotifyCommand("herdr-name off"), { kind: "herdr-name-disable" });
+		assert.deepEqual(parseNotifyCommand("system focus on"), { kind: "focus-enable" });
+		assert.deepEqual(parseNotifyCommand("system focus off"), { kind: "focus-disable" });
+		assert.deepEqual(parseNotifyCommand("system sound on"), { kind: "sound-enable" });
+		assert.deepEqual(parseNotifyCommand("system sound off"), { kind: "sound-disable" });
 		assert.deepEqual(parseNotifyCommand("test foo bar"), { kind: "test", message: "foo bar" });
 		assert.equal(parseNotifyCommand("system foo").kind, "error");
+		assert.equal(parseNotifyCommand("focus foo").kind, "error");
+		assert.equal(parseNotifyCommand("sound foo").kind, "error");
 		assert.equal(parseNotifyCommand("invalid").kind, "error");
 	});
 
@@ -116,6 +128,24 @@ describe("notify command", () => {
 		await notifyCmd.handler("on", ctx);
 		assert.equal(loadSystemConfig().enabled, true);
 		assert.equal(loadConfig().enabled, true);
+
+		// Toggle focus suppression
+		await notifyCmd.handler("focus off", ctx);
+		assert.equal(loadSystemConfig().suppressWhenFocused, false);
+		await notifyCmd.handler("focus on", ctx);
+		assert.equal(loadSystemConfig().suppressWhenFocused, true);
+
+		// Toggle sound
+		await notifyCmd.handler("sound off", ctx);
+		assert.equal(loadSystemConfig().sound, false);
+		await notifyCmd.handler("sound on", ctx);
+		assert.equal(loadSystemConfig().sound, true);
+
+		// Toggle Herdr agent name
+		await notifyCmd.handler("herdr-name on", ctx);
+		assert.equal(loadSystemConfig().herdr.showAgentName, true);
+		await notifyCmd.handler("herdr-name off", ctx);
+		assert.equal(loadSystemConfig().herdr.showAgentName, false);
 	});
 
 	it("renders combined status output with /notify status", async () => {
