@@ -429,6 +429,123 @@ describe("HerdrTracker process formatting and states", () => {
 	});
 });
 
+describe("HerdrTracker agent state matrix", () => {
+	function setup() {
+		const tracker = new HerdrTracker();
+		const handlers = new Map<string, any>();
+		const events = new Map<string, any>();
+		tracker.wirePiEvents({
+			on: (name: string, cb: any) => handlers.set(name, cb),
+			events: { on: (name: string, cb: any) => events.set(name, cb) },
+		});
+		return { tracker, handlers, events };
+	}
+
+	it("moves from initial idle through thinking/tool work to success and fatal-error idle", () => {
+		const { tracker, handlers } = setup();
+		assert.equal(tracker.getDesiredState().state, "idle");
+		handlers.get("agent_start")?.();
+		assert.equal(tracker.getDesiredState().state, "working");
+		handlers.get("tool_execution_start")?.({ toolCallId: "read", toolName: "read" });
+		assert.equal(tracker.getDesiredState().state, "working");
+		handlers.get("agent_settled")?.({}, { isIdle: () => true });
+		assert.deepEqual(tracker.getDesiredState(), { state: "idle", message: "[success]", displayAgent: "pi [✅ success]" });
+		handlers.get("agent_start")?.();
+		handlers.get("agent_end")?.({ messages: [{ role: "assistant", stopReason: "error" }] });
+		handlers.get("agent_settled")?.({}, { isIdle: () => true });
+		assert.equal(tracker.getDesiredState().message, "[error]");
+	});
+
+	it("blocks during gentle_review consent ui_prompt despite the active tool", () => {
+		const { tracker, handlers } = setup();
+		handlers.get("agent_start")?.();
+		handlers.get("tool_execution_start")?.({ toolCallId: "review", toolName: "gentle_review" });
+		handlers.get("ui_prompt_start")?.({ reason: "ui_prompt", kind: "select", title: "Consent" });
+		const state = tracker.getDesiredState();
+		assert.equal(state.state, "blocked");
+		assert.ok(state.message?.includes("esperando respuesta"));
+		assert.ok(state.displayAgent?.includes("❓"));
+	});
+
+	it("blocks codemode while ask-user-question is awaiting input", () => {
+		const { tracker, handlers, events } = setup();
+		handlers.get("agent_start")?.();
+		handlers.get("tool_execution_start")?.({ toolCallId: "code", toolName: "codemode" });
+		events.get("gentle-pi:ask-user-question:blocked")?.({ active: true });
+		const state = tracker.getDesiredState();
+		assert.equal(state.state, "blocked");
+		assert.ok(state.displayAgent?.includes("❓"));
+	});
+
+	it("keeps question blocker when another parallel tool becomes current", () => {
+		const { tracker, handlers, events } = setup();
+		handlers.get("agent_start")?.();
+		handlers.get("tool_execution_start")?.({ toolCallId: "choice", toolName: "ask_user_choice" });
+		events.get("gentle-pi:ask-user-choice:blocked")?.({ active: true });
+		handlers.get("tool_execution_start")?.({ toolCallId: "bash", toolName: "bash" });
+		assert.equal(tracker.getDesiredState().state, "blocked");
+		handlers.get("tool_execution_end")?.({ toolCallId: "bash", toolName: "bash" });
+		assert.equal(tracker.getDesiredState().state, "blocked");
+		events.get("gentle-pi:ask-user-choice:blocked")?.({ active: false });
+		assert.equal(tracker.getDesiredState().state, "working");
+	});
+
+	it("keeps herdr:blocked active while a non-ask tool runs", () => {
+		const { tracker, handlers, events } = setup();
+		handlers.get("agent_start")?.();
+		events.get("herdr:blocked")?.({ active: true, label: "Choice awaiting input" });
+		handlers.get("tool_execution_start")?.({ toolCallId: "edit", toolName: "edit" });
+		const state = tracker.getDesiredState();
+		assert.equal(state.state, "blocked");
+		assert.equal(state.message, "Choice awaiting input");
+		assert.ok(state.displayAgent?.includes("❓"));
+	});
+
+	it("clears blockers on prompt end and blocker end, then settles to success", () => {
+		const { tracker, handlers, events } = setup();
+		handlers.get("agent_start")?.();
+		handlers.get("tool_execution_start")?.({ toolCallId: "review", toolName: "gentle_review" });
+		handlers.get("ui_prompt_start")?.({});
+		handlers.get("tool_execution_start")?.({ toolCallId: "parallel", toolName: "read" });
+		assert.equal(tracker.getDesiredState().state, "blocked");
+		handlers.get("ui_prompt_end")?.({});
+		assert.equal(tracker.getDesiredState().state, "working");
+		handlers.get("tool_execution_end")?.({ toolCallId: "review", toolName: "gentle_review" });
+		events.get("gentle-pi:ask-user-question:blocked")?.({ active: true });
+		events.get("gentle-pi:ask-user-question:blocked")?.({ active: false });
+		assert.equal(tracker.getDesiredState().state, "working");
+		handlers.get("agent_settled")?.({}, { isIdle: () => true });
+		assert.equal(tracker.getDesiredState().message, "[success]");
+	});
+
+	it("remains blocked until all overlapping blockers end", () => {
+		const { tracker, handlers, events } = setup();
+		handlers.get("agent_start")?.();
+		events.get("herdr:blocked")?.({ active: true, label: "Choice awaiting input" });
+		events.get("gentle-pi:ask-user-choice:blocked")?.({ active: true });
+		events.get("herdr:blocked")?.({ active: false });
+		assert.equal(tracker.getDesiredState().state, "blocked");
+		events.get("gentle-pi:ask-user-choice:blocked")?.({ active: false });
+		assert.equal(tracker.getDesiredState().state, "working");
+	});
+
+	it("publishes blocked state to the Herdr pane during gentle_review consent", async () => {
+		const sent: any[] = [];
+		const tracker = new HerdrTracker({
+			env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: "test.sock", HERDR_PANE_ID: "w1:p1" },
+			sendRequest: async (_endpoint, request) => { sent.push(request); return true; },
+			writeStdout: () => {},
+		});
+		const handlers = new Map<string, any>();
+		tracker.wirePiEvents({ on: (name: string, cb: any) => handlers.set(name, cb), events: { on: () => {} } });
+		handlers.get("agent_start")?.();
+		handlers.get("tool_execution_start")?.({ toolCallId: "review", toolName: "gentle_review" });
+		handlers.get("ui_prompt_start")?.({ kind: "select" });
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.ok(sent.some((request) => request.method === "pane.report_agent" && request.params.state === "blocked"));
+	});
+});
+
 describe("HerdrTracker diagnostics", () => {
 	it("is silent by default and emits bounded redacted activity, state, and IPC traces when enabled", async () => {
 		const lines: string[] = [];
@@ -537,7 +654,7 @@ describe("HerdrTracker diagnostics", () => {
 
 	it("does not invoke diagnostic writer when diagnostics are disabled", () => {
 		let writes = 0;
-		const tracker = new HerdrTracker({ writeDiagnostic: () => writes++ });
+		const tracker = new HerdrTracker({ env: {}, writeDiagnostic: () => writes++ });
 		tracker.handleSubagentActivity({ tasks: [{ status: "running" }] });
 		tracker.publishState(true);
 		assert.equal(writes, 0);

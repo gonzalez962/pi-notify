@@ -266,18 +266,7 @@ export class HerdrTracker {
 	}
 
 	public isBlocked(): boolean {
-		if (this.activeBlockers.size === 0) return false;
-		// If main agent is actively working with a non-interactive tool (e.g. read, grep, bash, edit),
-		// it is executing work and cannot be blocked waiting for human input.
-		if (
-			this.isMainAgentWorking &&
-			this.currentToolName &&
-			this.currentToolName !== "ask_user_choice" &&
-			this.currentToolName !== "ask_user_question"
-		) {
-			return false;
-		}
-		return true;
+		return this.activeBlockers.size > 0;
 	}
 
 	public getDesiredState(): {
@@ -803,10 +792,6 @@ export class HerdrTracker {
 				this.activeToolCalls.set(toolCallId, toolName);
 			}
 			this.currentToolName = toolName;
-			if (toolName && toolName !== "ask_user_choice" && toolName !== "ask_user_question") {
-				this.activeBlockers.delete("ui_prompt");
-				this.activeBlockerMessages.delete("ui_prompt");
-			}
 			this.publishState();
 			const deferred = setTimeout(() => {
 				if (!this.isDisposed) this.publishState();
