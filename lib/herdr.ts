@@ -72,6 +72,7 @@ export interface HerdrTrackerOptions {
 	env?: NodeJS.ProcessEnv;
 	platform?: string;
 	writeStdout?: (chunk: string) => void;
+	writeDiagnostic?: (line: string) => void;
 	sendRequest?: (endpoint: string, request: unknown, timeoutMs?: number) => Promise<boolean>;
 	showAgentPrefix?: boolean;
 }
@@ -122,6 +123,9 @@ export class HerdrTracker {
 	private writeStdout: (chunk: string) => void;
 	private sendRequestFn: (endpoint: string, request: unknown, timeoutMs?: number) => Promise<boolean>;
 	private showAgentPrefix: boolean;
+	private writeDiagnostic: (line: string) => void;
+	private diagnosticsEnabled: boolean;
+	private diagnosticLines = 0;
 
 	private isDisposed = false;
 	private isMainAgentWorking = false;
@@ -167,6 +171,20 @@ export class HerdrTracker {
 		});
 		this.sendRequestFn = options.sendRequest ?? sendHerdrRequestDefault;
 		this.showAgentPrefix = options.showAgentPrefix ?? true;
+		this.diagnosticsEnabled = this.env.PI_NOTIFY_HERDR_DIAGNOSTICS === "1";
+		this.writeDiagnostic = options.writeDiagnostic ?? ((line) => { process.stderr.write(`${line}\n`); });
+	}
+
+	private diagnostic(event: string, fields: Record<string, string | number | boolean>): void {
+		if (!this.diagnosticsEnabled || this.diagnosticLines >= 500) return;
+		try {
+			const line = JSON.stringify({ component: "pi-notify.herdr", event, ...fields });
+			// Diagnostic records contain only fixed keys and allow-listed values. Drop
+			// any unexpected oversized record rather than slicing malformed JSONL.
+			if (line.length > 500) return;
+			this.writeDiagnostic(line);
+			this.diagnosticLines++;
+		} catch {}
 	}
 
 	public setShowAgentPrefix(val: boolean): void {
@@ -401,9 +419,25 @@ export class HerdrTracker {
 
 	private async executeSend(request: unknown): Promise<void> {
 		const endpoint = getHerdrSocketEndpoint(this.env.HERDR_SOCKET_PATH, this.platform);
-		if (!endpoint) return;
-		if (await this.sendRequestFn(endpoint, request, 500)) return;
-		await this.sendRequestFn(endpoint, request, 1500);
+		const requestMethod = (request as any)?.method;
+		const method = requestMethod === "pane.report_agent" || requestMethod === "pane.report_metadata"
+			? requestMethod
+			: "unknown";
+		if (!endpoint) {
+			this.diagnostic("ipc_send", { method, attempt: 0, success: false, outcome: "no_endpoint" });
+			return;
+		}
+		let first: boolean;
+		try {
+			first = await this.sendRequestFn(endpoint, request, 500);
+		} catch (error) {
+			this.diagnostic("ipc_send", { method, attempt: 1, success: false, outcome: "send_error" });
+			throw error;
+		}
+		this.diagnostic("ipc_send", { method, attempt: 1, success: first });
+		if (first) return;
+		const retry = await this.sendRequestFn(endpoint, request, 1500);
+		this.diagnostic("ipc_send", { method, attempt: 2, success: retry, retry: true });
 	}
 
 	private async drainQueue(): Promise<void> {
@@ -474,6 +508,12 @@ export class HerdrTracker {
 	public publishState(force = false): void {
 		if (this.isDisposed) return;
 		const next = this.getDesiredState();
+		this.diagnostic("desired_state", {
+			state: next.state,
+			activeTools: this.activeToolCalls.size,
+			activeSubagents: this.activeSubagents.size,
+			blockers: this.activeBlockers.size,
+		});
 		const displayChanged = next.displayAgent !== this.lastReportedDisplayAgent;
 
 		if (
@@ -521,6 +561,17 @@ export class HerdrTracker {
 	public handleSubagentActivity(data: unknown): void {
 		if (this.isDisposed || !data || typeof data !== "object") return;
 		const payload = data as { tasks?: TrackedSubagent[] };
+		const statuses: Record<string, number> = {};
+		if (Array.isArray(payload.tasks)) {
+			for (const task of payload.tasks) {
+				const rawStatus = task?.status;
+				const status = rawStatus === "running" || rawStatus === "queued" || rawStatus === "waiting" || rawStatus === "completed" || rawStatus === "failed"
+					? rawStatus
+					: "unknown";
+				statuses[status] = (statuses[status] ?? 0) + 1;
+			}
+		}
+		this.diagnostic("activity_received", { taskCount: Array.isArray(payload.tasks) ? payload.tasks.length : 0, statuses: JSON.stringify(statuses) });
 		this.activeSubagents.clear();
 		if (Array.isArray(payload.tasks)) {
 			for (const t of payload.tasks) {

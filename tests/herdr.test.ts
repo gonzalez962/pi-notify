@@ -429,6 +429,121 @@ describe("HerdrTracker process formatting and states", () => {
 	});
 });
 
+describe("HerdrTracker diagnostics", () => {
+	it("is silent by default and emits bounded redacted activity, state, and IPC traces when enabled", async () => {
+		const lines: string[] = [];
+		const sent: unknown[] = [];
+		const tracker = new HerdrTracker({
+			env: { PI_NOTIFY_HERDR_DIAGNOSTICS: "1", HERDR_ENV: "1", HERDR_SOCKET_PATH: "secret-socket-path", HERDR_PANE_ID: "secret-pane" },
+			writeStdout: () => {},
+			writeDiagnostic: (line) => lines.push(line),
+			sendRequest: async (_endpoint, request) => { sent.push(request); return true; },
+		});
+		const handlers = new Map<string, any>();
+		const events = new Map<string, any>();
+		tracker.wirePiEvents({ on: (name: string, cb: any) => handlers.set(name, cb), events: { on: (name: string, cb: any) => events.set(name, cb) } });
+		const secret = "PRIVATE_PROMPT_SESSION_AGENT_MESSAGE";
+		handlers.get("session_start")?.({}, {});
+		events.get("gentle-agents:activity")?.({ tasks: [{ id: secret, agent: secret, label: secret, lastStep: secret, status: "running" }] });
+		handlers.get("agent_settled")?.({}, { isIdle: () => true });
+		events.get("gentle-agents:activity")?.({ tasks: [] });
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.ok(lines.some((line) => line.includes('"event":"activity_received"')));
+		assert.ok(lines.some((line) => line.includes('"event":"desired_state"')));
+		assert.ok(lines.some((line) => line.includes('"event":"ipc_send"')));
+		const stateTraces = lines.map((line) => JSON.parse(line)).filter((entry) => entry.event === "desired_state");
+		assert.ok(stateTraces.some((entry) => entry.state === "working"));
+		assert.ok(stateTraces.some((entry) => entry.state === "idle"));
+		assert.ok(lines.every((line) => !line.includes(secret)));
+		assert.ok(lines.every((line) => !line.includes("secret-socket-path") && !line.includes("secret-pane")));
+		assert.ok(sent.length > 0);
+	});
+
+	it("records IPC retry outcomes and isolates diagnostic writer failures", async () => {
+		let calls = 0;
+		const tracker = new HerdrTracker({
+			env: { PI_NOTIFY_HERDR_DIAGNOSTICS: "1", HERDR_ENV: "1", HERDR_SOCKET_PATH: "sock", HERDR_PANE_ID: "pane" },
+			writeStdout: () => {},
+			writeDiagnostic: () => { throw new Error("diagnostic output failed"); },
+			sendRequest: async () => ++calls > 1,
+		});
+		const handlers = new Map<string, any>();
+		tracker.wirePiEvents({ on: (name: string, cb: any) => handlers.set(name, cb), events: { on: () => {} } });
+		handlers.get("agent_start")?.();
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.ok(calls >= 2, "failed first IPC send should still retry");
+		assert.equal(tracker.getDesiredState().state, "working");
+	});
+
+	it("reports failed IPC attempt followed by retry success", async () => {
+		const lines: string[] = [];
+		let calls = 0;
+		const tracker = new HerdrTracker({
+			env: { PI_NOTIFY_HERDR_DIAGNOSTICS: "1", HERDR_ENV: "1", HERDR_SOCKET_PATH: "sock", HERDR_PANE_ID: "pane" },
+			writeStdout: () => {},
+			writeDiagnostic: (line) => lines.push(line),
+			sendRequest: async () => ++calls > 1,
+		});
+		const handlers = new Map<string, any>();
+		tracker.wirePiEvents({ on: (name: string, cb: any) => handlers.set(name, cb), events: { on: () => {} } });
+		handlers.get("agent_start")?.();
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.ok(lines.some((line) => line.includes('"attempt":1,"success":false')));
+		assert.ok(lines.some((line) => line.includes('"attempt":2,"success":true,"retry":true')));
+	});
+
+	it("preserves one-attempt thrown-send rejection parity with diagnostics enabled and disabled", async () => {
+		for (const enabled of [false, true]) {
+			let calls = 0;
+			const rejection = new Error("send rejected");
+			const tracker = new HerdrTracker({
+				env: { ...(enabled ? { PI_NOTIFY_HERDR_DIAGNOSTICS: "1" } : {}), HERDR_SOCKET_PATH: "sock", HERDR_PANE_ID: "pane" },
+				writeStdout: () => {},
+				writeDiagnostic: () => {},
+				sendRequest: async () => { calls++; throw rejection; },
+			});
+			await assert.rejects((tracker as any).executeSend({ method: "pane.report_agent" }), rejection);
+			assert.equal(calls, 1);
+		}
+	});
+
+	it("keeps every diagnostic record valid JSON within the record and character caps", () => {
+		const lines: string[] = [];
+		const tracker = new HerdrTracker({
+			env: { PI_NOTIFY_HERDR_DIAGNOSTICS: "1" },
+			writeDiagnostic: (line) => lines.push(line),
+			writeStdout: () => {},
+		});
+		for (let i = 0; i < 700; i++) tracker.publishState(true);
+		assert.equal(lines.length, 500);
+		for (const line of lines) {
+			assert.ok(line.length <= 500);
+			assert.doesNotThrow(() => JSON.parse(line));
+		}
+	});
+
+	it("redacts arbitrary oversized IPC method names", async () => {
+		const lines: string[] = [];
+		const tracker = new HerdrTracker({
+			env: { PI_NOTIFY_HERDR_DIAGNOSTICS: "1", HERDR_SOCKET_PATH: "sock", HERDR_PANE_ID: "pane" },
+			writeDiagnostic: (line) => lines.push(line),
+			sendRequest: async () => true,
+		});
+		await (tracker as any).executeSend({ method: `secret-${"x".repeat(1000)}` });
+		assert.ok(lines.length > 0);
+		assert.ok(lines.every((line) => JSON.parse(line).method === "unknown"));
+		assert.ok(lines.every((line) => !line.includes("secret-") && line.length <= 500));
+	});
+
+	it("does not invoke diagnostic writer when diagnostics are disabled", () => {
+		let writes = 0;
+		const tracker = new HerdrTracker({ writeDiagnostic: () => writes++ });
+		tracker.handleSubagentActivity({ tasks: [{ status: "running" }] });
+		tracker.publishState(true);
+		assert.equal(writes, 0);
+	});
+});
+
 describe("HerdrTracker socket communication", () => {
 	it("sends pane.report_agent and pane.report_metadata over mock socket in Herdr env", async () => {
 		const sentRequests: any[] = [];
