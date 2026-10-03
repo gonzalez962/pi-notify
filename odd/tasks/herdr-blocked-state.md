@@ -32,3 +32,5 @@ Commands: `node --experimental-strip-types --test tests/herdr.test.ts`; `npm tes
 - Re-verifier `murvq1nh-4-32pn`: focused 41/41 (ambient and cleaned env), `npm test` 207/207, `git diff --check` clean (LF/CRLF warning only).
 - RED (parent, `git archive HEAD` into a temp dir with the new tests, cleaned env): 35 pass / 6 fail -- gentle_review consent, codemode question, parallel tool, herdr:blocked during tool, end-edge lifecycle, pane report blocked.
 - Not verified: live Herdr pane rendering.
+
+- Work-unit commit: `1c39216` fix(herdr): report blocked whenever a user-action blocker is active.
