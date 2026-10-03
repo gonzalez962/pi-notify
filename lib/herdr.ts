@@ -48,6 +48,26 @@ export function getGentleOddPhase(sessionId?: string): string | undefined {
 	}
 }
 
+export function getGentlePromptLabel(sessionId?: string): string {
+	try {
+		const registry = (globalThis as any)[ODD_PHASE_REGISTRY];
+		const label = typeof registry?.label === "function" ? registry.label(sessionId) : undefined;
+		const phase = label ?? getGentleOddPhase(sessionId) ?? "Working";
+		const normalized = String(phase).replace(/(?:…|\.\.\.)+$/u, "").trim();
+		return normalized ? normalized[0]!.toUpperCase() + normalized.slice(1) : "Working";
+	} catch {
+		return "Working";
+	}
+}
+
+function capitalize(value: string): string {
+	return value ? value[0]!.toUpperCase() + value.slice(1) : value;
+}
+
+function formatToolName(name: string): string {
+	return capitalize(name.replace(/^mcp__.+?__/u, "").replace(/_/gu, "-"));
+}
+
 export interface HerdrTrackerOptions {
 	env?: NodeJS.ProcessEnv;
 	platform?: string;
@@ -116,6 +136,7 @@ export class HerdrTracker {
 	private hasRunTask = false;
 	private retryTimers: NodeJS.Timeout[] = [];
 	private keepaliveTimer: NodeJS.Timeout | null = null;
+	private phaseRefreshTimer: NodeJS.Timeout | null = null;
 
 	private lastReportedState: HerdrAgentState | undefined;
 	private lastReportedMessage: string | undefined;
@@ -262,57 +283,30 @@ export class HerdrTracker {
 
 		const hasSub = this.activeSubagents.size > 0;
 		if (this.isMainAgentWorking || hasSub) {
-			let desc: string;
-			let display: string;
-			const oddPhase = getGentleOddPhase(this.getActiveSessionId());
-			if (this.currentActivityNotice) {
-				const suffix = hasSub ? ` (+${this.activeSubagents.size} sub)` : "";
-				desc = `[${this.currentActivityNotice}${suffix}]`;
-				display = this.formatDisplayAgent(`[⏳ ${this.currentActivityNotice}${suffix}]`);
-			} else if (
-				this.isMainAgentWorking &&
-				this.currentToolName &&
-				this.currentToolName !== "subagent_run" &&
-				this.currentToolName !== "subagent"
-			) {
-				const suffix = hasSub ? ` (+${this.activeSubagents.size} sub)` : "";
-				desc = `[${this.currentToolName}${suffix}]`;
-				display = this.formatDisplayAgent(`[⏳ ${this.currentToolName}${suffix}]`);
-			} else if (hasSub) {
-				if (this.activeSubagents.size === 1) {
-					const sub = Array.from(this.activeSubagents.values())[0]!;
-					const step =
-						sub.lastStep &&
-						sub.lastStep !== "queued" &&
-						sub.lastStep !== "starting" &&
-						sub.lastStep !== "done"
-							? `: ${sub.lastStep}`
-							: "";
-					desc = `[${sub.agent}${step}]`;
-					display = this.formatDisplayAgent(`[⏳ ${sub.agent}${step}]`);
-				} else {
-					const names = Array.from(this.activeSubagents.values())
-						.map((s) => s.agent)
-						.join(", ");
-					const label =
-						this.activeSubagents.size <= 2 ? names : `${this.activeSubagents.size} subagentes`;
-					desc = `[${label}]`;
-					display = this.formatDisplayAgent(`[⏳ ${label}]`);
-				}
-			} else if (this.currentToolName) {
-				desc = `[${this.currentToolName}]`;
-				display = this.formatDisplayAgent(`[⏳ ${this.currentToolName}]`);
-			} else if (oddPhase && oddPhase !== "deciding") {
-				const suffix = hasSub ? ` (+${this.activeSubagents.size} sub)` : "";
-				desc = `[${oddPhase}${suffix}]`;
-				display = this.formatDisplayAgent(`[⏳ ${oddPhase}${suffix}]`);
-			} else {
-				const suffix = hasSub ? ` (+${this.activeSubagents.size} sub)` : "";
-				desc = `[pensando${suffix}]`;
-				display = this.formatDisplayAgent(`[⏳ pensando${suffix}]`);
+			const label = getGentlePromptLabel(this.getActiveSessionId());
+			const excluded = new Set(["subagent_run", "subagent", "gentle_odd_phase", "ask_user_choice", "ask_user_question"]);
+			const tools = this.activeToolCalls.size
+				? Array.from(new Set(this.activeToolCalls.values()))
+				: this.currentToolName ? [this.currentToolName] : [];
+			const items: string[] = [];
+			if (this.currentActivityNotice) items.push(capitalize(this.currentActivityNotice));
+			for (const tool of tools) {
+				const stripped = tool.replace(/^mcp__.+?__/u, "");
+				if (!excluded.has(stripped)) items.push(formatToolName(tool));
 			}
-
-			return { state: "working", message: desc, displayAgent: display };
+			const subs = Array.from(this.activeSubagents.values());
+			for (const sub of subs) items.push(capitalize(sub.agent));
+			let suffixItems = items;
+			if (items.length === 1 && subs.length === 1 && items[0] === capitalize(subs[0]!.agent)) {
+				const step = subs[0]!.lastStep;
+				if (step && !["queued", "starting", "done"].includes(step.toLowerCase())) {
+					suffixItems = [`${capitalize(subs[0]!.agent)}: ${step}`];
+				}
+			}
+			if (suffixItems.length > 3) suffixItems = [...suffixItems.slice(0, 3), `+${suffixItems.length - 3}`];
+			const message = `${label}${suffixItems.length ? ` - ${suffixItems.join("/")}` : ""}`;
+			const display = this.formatDisplayAgent(`[⏳ ${message}]`);
+			return { state: "working", message, displayAgent: display };
 		}
 
 		if (!this.hasRunTask) {
@@ -343,7 +337,7 @@ export class HerdrTracker {
 		let progressSeq = WT_PROGRESS_CLEAR;
 
 		if (state === "working") {
-			const label = desc ?? "[pensando...]";
+			const label = desc ?? "Working";
 			title = `⏳ ${label} ${base}`;
 			progressSeq = WT_PROGRESS_WORKING;
 		} else if (state === "blocked") {
@@ -371,6 +365,10 @@ export class HerdrTracker {
 		if (this.keepaliveTimer !== null) {
 			clearInterval(this.keepaliveTimer);
 			this.keepaliveTimer = null;
+		}
+		if (this.phaseRefreshTimer !== null) {
+			clearInterval(this.phaseRefreshTimer);
+			this.phaseRefreshTimer = null;
 		}
 	}
 
@@ -500,6 +498,10 @@ export class HerdrTracker {
 			this.scheduleRetries(next.message, next.state);
 		} else {
 			this.clearTimers();
+			if (next.state === "working" && this.phaseRefreshTimer === null) {
+				this.phaseRefreshTimer = setInterval(() => this.publishState(), 500);
+				this.phaseRefreshTimer.unref?.();
+			}
 		}
 
 		if (this.isHerdrEnvironment()) {
@@ -755,6 +757,10 @@ export class HerdrTracker {
 				this.activeBlockerMessages.delete("ui_prompt");
 			}
 			this.publishState();
+			const deferred = setTimeout(() => {
+				if (!this.isDisposed) this.publishState();
+			}, 0);
+			deferred.unref?.();
 		});
 
 		pi.on("tool_execution_end", (event: any, ctx: any) => {

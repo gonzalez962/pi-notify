@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
 	HerdrTracker,
+	getGentlePromptLabel,
 	getHerdrSocketEndpoint,
 	isHerdrActive,
 } from "../lib/herdr.ts";
@@ -51,6 +52,75 @@ describe("Herdr helper functions", () => {
 });
 
 describe("HerdrTracker process formatting and states", () => {
+	it("uses registry prompt label and ordered distinct tool suffixes", () => {
+		const key = Symbol.for("gentle-pi.odd-phase-registry");
+		const prior = (globalThis as any)[key];
+		try {
+			(globalThis as any)[key] = { label: () => "exploring…" };
+			const tracker = new HerdrTracker();
+			const handlers = new Map<string, any>();
+			tracker.wirePiEvents({ on: (name: string, cb: any) => handlers.set(name, cb), events: { on: () => {} } });
+			handlers.get("agent_start")?.();
+			handlers.get("tool_execution_start")?.({ toolCallId: "g", toolName: "grep" });
+			handlers.get("tool_execution_start")?.({ toolCallId: "r", toolName: "gentle_review" });
+			assert.equal(tracker.getDesiredState().message, "Exploring - Grep/Gentle-review");
+		} finally {
+			if (prior === undefined) delete (globalThis as any)[key]; else (globalThis as any)[key] = prior;
+		}
+	});
+
+	it("republishes after tool start to pick up a later inferred phase", async () => {
+		const key = Symbol.for("gentle-pi.odd-phase-registry");
+		const prior = (globalThis as any)[key];
+		let phase: string | undefined;
+		try {
+			(globalThis as any)[key] = { label: () => phase };
+			const tracker = new HerdrTracker();
+			const handlers = new Map<string, any>();
+			tracker.wirePiEvents({ on: (name: string, cb: any) => handlers.set(name, cb), events: { on: () => {} } });
+			handlers.get("agent_start")?.();
+			handlers.get("tool_execution_start")?.({ toolCallId: "x", toolName: "grep" });
+			phase = "deciding";
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			assert.equal(tracker.getDesiredState().message, "Deciding - Grep");
+		} finally {
+			if (prior === undefined) delete (globalThis as any)[key]; else (globalThis as any)[key] = prior;
+		}
+	});
+
+	it("normalizes ellipsis variants in prompt labels", () => {
+		const key = Symbol.for("gentle-pi.odd-phase-registry");
+		const previous = (globalThis as any)[key];
+		try {
+			(globalThis as any)[key] = { label: () => "checking..." };
+			assert.equal(getGentlePromptLabel(), "Checking");
+			(globalThis as any)[key] = { label: () => "working…" };
+			assert.equal(getGentlePromptLabel(), "Working");
+		} finally {
+			if (previous === undefined) delete (globalThis as any)[key];
+			else (globalThis as any)[key] = previous;
+		}
+	});
+
+	it("formats MCP tools, overflow, fallback label, and stepped subagent", () => {
+		const tracker = new HerdrTracker();
+		const handlers = new Map<string, any>();
+		const events = new Map<string, any>();
+		tracker.wirePiEvents({ on: (name: string, cb: any) => handlers.set(name, cb), events: { on: (name: string, cb: any) => events.set(name, cb) } });
+		handlers.get("agent_start")?.();
+		assert.equal(getGentlePromptLabel(), "Working");
+		assert.equal(tracker.getDesiredState().message, "Working");
+		for (const [id, toolName] of [["1", "mcp__custom-tools__grep"], ["2", "read"], ["3", "write"], ["4", "bash"]]) {
+			handlers.get("tool_execution_start")?.({ toolCallId: id, toolName });
+		}
+		assert.equal(tracker.getDesiredState().message, "Working - Grep/Read/Write/+1");
+		const oneSub = new HerdrTracker();
+		const sh = new Map<string, any>();
+		const se = new Map<string, any>();
+		oneSub.wirePiEvents({ on: (name: string, cb: any) => sh.set(name, cb), events: { on: (name: string, cb: any) => se.set(name, cb) } });
+		se.get("gentle-agents:activity")?.({ tasks: [{ id: "x", agent: "gentle-ai-worker", status: "running", lastStep: "editing src/app.ts" }] });
+		assert.equal(oneSub.getDesiredState().message, "Working - Gentle-ai-worker: editing src/app.ts");
+	});
 	it("reports idle state when nothing is active", () => {
 		const tracker = new HerdrTracker();
 		const state = tracker.getDesiredState();
@@ -81,8 +151,8 @@ describe("HerdrTracker process formatting and states", () => {
 
 		const state = tracker.getDesiredState();
 		assert.equal(state.state, "working");
-		assert.equal(state.message, "[bash]");
-		assert.equal(state.displayAgent, "pi [⏳ bash]");
+		assert.equal(state.message, "Working - Bash");
+		assert.equal(state.displayAgent, "pi [⏳ Working - Bash]");
 	});
 
 	it("formats subagent activity and combines with main tool", () => {
@@ -105,22 +175,22 @@ describe("HerdrTracker process formatting and states", () => {
 
 		let state = tracker.getDesiredState();
 		assert.equal(state.state, "working");
-		assert.equal(state.message, "[explore: read]");
-		assert.equal(state.displayAgent, "pi [⏳ explore: read]");
+		assert.equal(state.message, "Working - Explore: read");
+		assert.equal(state.displayAgent, "pi [⏳ Working - Explore: read]");
 
 		// Main agent also executes a tool
 		handlers.get("tool_execution_start")?.({ toolName: "write" });
 		state = tracker.getDesiredState();
 		assert.equal(state.state, "working");
-		assert.equal(state.message, "[write (+1 sub)]");
-		assert.equal(state.displayAgent, "pi [⏳ write (+1 sub)]");
+		assert.equal(state.message, "Working - Write/Explore");
+		assert.equal(state.displayAgent, "pi [⏳ Working - Write/Explore]");
 
 		// Tool ends
 		handlers.get("tool_execution_end")?.({ toolName: "write" });
 		state = tracker.getDesiredState();
 		assert.equal(state.state, "working");
-		assert.equal(state.message, "[explore: read]");
-		assert.equal(state.displayAgent, "pi [⏳ explore: read]");
+		assert.equal(state.message, "Working - Explore: read");
+		assert.equal(state.displayAgent, "pi [⏳ Working - Explore: read]");
 	});
 
 	it("keeps working state when main agent settles but subagent is still running", () => {
@@ -146,8 +216,8 @@ describe("HerdrTracker process formatting and states", () => {
 
 		const state = tracker.getDesiredState();
 		assert.equal(state.state, "working");
-		assert.equal(state.message, "[worker: edit]");
-		assert.equal(state.displayAgent, "pi [⏳ worker: edit]");
+		assert.equal(state.message, "Working - Worker: edit");
+		assert.equal(state.displayAgent, "pi [⏳ Working - Worker: edit]");
 
 		// Subagent finishes
 		eventHandlers.get("gentle-agents:activity")?.({ tasks: [] });
@@ -196,24 +266,24 @@ describe("HerdrTracker process formatting and states", () => {
 		handlers.get("tool_execution_start")?.({ toolCallId: "call_outer", toolName: "codemode" });
 		let state = tracker.getDesiredState();
 		assert.equal(state.state, "working");
-		assert.equal(state.message, "[codemode]");
+		assert.equal(state.message, "Working - Codemode");
 
 		// Nested tool starts (e.g. read with parentToolCallId)
 		handlers.get("tool_execution_start")?.({ toolCallId: "call_outer/1", toolName: "read", parentToolCallId: "call_outer" });
 		state = tracker.getDesiredState();
-		assert.equal(state.message, "[read]");
+		assert.equal(state.message, "Working - Codemode/Read");
 
 		// Nested tool finishes
 		handlers.get("tool_execution_end")?.({ toolCallId: "call_outer/1", toolName: "read", parentToolCallId: "call_outer" });
 		state = tracker.getDesiredState();
 		// Parent tool MUST still be active!
 		assert.equal(state.state, "working");
-		assert.equal(state.message, "[codemode]");
+		assert.equal(state.message, "Working - Codemode");
 
 		// Outer tool finishes
 		handlers.get("tool_execution_end")?.({ toolCallId: "call_outer", toolName: "codemode" });
 		state = tracker.getDesiredState();
-		assert.equal(state.message, "[pensando]");
+		assert.equal(state.message, "Working");
 	});
 
 	it("prioritizes subagent name and step when main tool is subagent_run", () => {
@@ -237,8 +307,8 @@ describe("HerdrTracker process formatting and states", () => {
 
 		const state = tracker.getDesiredState();
 		assert.equal(state.state, "working");
-		assert.equal(state.message, "[gentle-ai-worker: editing src/app.ts]");
-		assert.equal(state.displayAgent, "pi [⏳ gentle-ai-worker: editing src/app.ts]");
+		assert.equal(state.message, "Working - Gentle-ai-worker: editing src/app.ts");
+		assert.equal(state.displayAgent, "pi [⏳ Working - Gentle-ai-worker: editing src/app.ts]");
 	});
 
 	it("activates working state on before_agent_start and user_bash", () => {
@@ -256,7 +326,7 @@ describe("HerdrTracker process formatting and states", () => {
 		// before_agent_start activates working state immediately
 		handlers.get("before_agent_start")?.({ prompt: "hello" });
 		assert.equal(tracker.getDesiredState().state, "working");
-		assert.equal(tracker.getDesiredState().message, "[pensando]");
+		assert.equal(tracker.getDesiredState().message, "Working");
 
 		// agent finishes
 		handlers.get("agent_settled")?.({}, { isIdle: () => true });
@@ -265,7 +335,7 @@ describe("HerdrTracker process formatting and states", () => {
 		// user_bash activates working state
 		handlers.get("user_bash")?.({ command: "git status" });
 		assert.equal(tracker.getDesiredState().state, "working");
-		assert.equal(tracker.getDesiredState().message, "[bash]");
+		assert.equal(tracker.getDesiredState().message, "Working - Bash");
 	});
 
 	it("formats compaction and auto-retry states", () => {
@@ -283,7 +353,7 @@ describe("HerdrTracker process formatting and states", () => {
 		handlers.get("session_before_compact")?.();
 		let state = tracker.getDesiredState();
 		assert.equal(state.state, "working");
-		assert.equal(state.message, "[compactando contexto]");
+		assert.equal(state.message, "Working - Compactando contexto");
 
 		// compaction ends
 		handlers.get("session_compact")?.();
@@ -294,7 +364,7 @@ describe("HerdrTracker process formatting and states", () => {
 		handlers.get("auto_retry_start")?.({ attempt: 2, maxAttempts: 3 });
 		state = tracker.getDesiredState();
 		assert.equal(state.state, "working");
-		assert.equal(state.message, "[reintentando (2/3)]");
+		assert.equal(state.message, "Working - Reintentando (2/3)");
 
 		// auto retry ends
 		handlers.get("auto_retry_end")?.();
@@ -351,7 +421,7 @@ describe("HerdrTracker process formatting and states", () => {
 
 		// Working state is preserved for parent orchestrator wake!
 		assert.equal(tracker.getDesiredState().state, "working");
-		assert.equal(tracker.getDesiredState().message, "[pensando]");
+		assert.equal(tracker.getDesiredState().message, "Working");
 
 		// Parent settles after processing subagent output
 		handlers.get("agent_settled")?.({}, { isIdle: () => true });
@@ -405,7 +475,7 @@ describe("HerdrTracker socket communication", () => {
 
 		const metaReport = sentRequests.find((r) => r.method === "pane.report_metadata");
 		assert.ok(metaReport);
-		assert.equal(metaReport.params.display_agent, "pi [⏳ bash]");
+		assert.equal(metaReport.params.display_agent, "pi [⏳ Working - Bash]");
 	});
 
 	it("formats thinking state when agent starts without a tool", () => {
@@ -422,8 +492,8 @@ describe("HerdrTracker socket communication", () => {
 
 		const state = tracker.getDesiredState();
 		assert.equal(state.state, "working");
-		assert.equal(state.message, "[pensando]");
-		assert.equal(state.displayAgent, "pi [⏳ pensando]");
+		assert.equal(state.message, "Working");
+		assert.equal(state.displayAgent, "pi [⏳ Working]");
 	});
 
 	it("formats fatal error on agent_end stopReason", () => {
@@ -457,8 +527,8 @@ describe("HerdrTracker socket communication", () => {
 		});
 
 		// Working
-		tracker.emitTerminalTitle("[bash]", "working");
-		assert.ok(lastWritten.includes("⏳ [bash]"));
+		tracker.emitTerminalTitle("Working - Bash", "working");
+		assert.ok(lastWritten.includes("⏳ Working - Bash"));
 		assert.ok(lastWritten.includes("\x1b]9;4;3\x07"));
 
 		// Blocked
@@ -497,8 +567,8 @@ describe("HerdrTracker socket communication", () => {
 		const state = tracker.getDesiredState();
 		// Must NOT be blocked with 'esperando respuesta' while tool is running!
 		assert.equal(state.state, "working");
-		assert.equal(state.message, "[read]");
-		assert.equal(state.displayAgent, "pi [⏳ read]");
+		assert.equal(state.message, "Working - Read");
+		assert.equal(state.displayAgent, "pi [⏳ Working - Read]");
 	});
 
 	it("formats gentle-pi ODD phase during thinking instead of generic pensando", () => {
@@ -526,13 +596,13 @@ describe("HerdrTracker socket communication", () => {
 
 		const state = tracker.getDesiredState();
 		assert.equal(state.state, "working");
-		assert.equal(state.message, "[exploring]");
-		assert.equal(state.displayAgent, "pi [⏳ exploring]");
+		assert.equal(state.message, "Exploring");
+		assert.equal(state.displayAgent, "pi [⏳ Exploring]");
 
 		delete (globalThis as any)[ODD_PHASE_REGISTRY];
 	});
 
-	it("transitions from [bash] to [exploring] or [pensando] when tool execution ends", () => {
+	it("transitions from Working - Bash to Exploring or Working when tool execution ends", () => {
 		const tracker = new HerdrTracker();
 		const handlers = new Map<string, any>();
 		const pi = {
@@ -559,15 +629,15 @@ describe("HerdrTracker socket communication", () => {
 		handlers.get("tool_execution_start")?.({ toolCallId: "call_1", toolName: "bash" }, ctx);
 		let state = tracker.getDesiredState();
 		assert.equal(state.state, "working");
-		assert.equal(state.message, "[bash]");
-		assert.equal(state.displayAgent, "pi [⏳ bash]");
+		assert.equal(state.message, "Exploring - Bash");
+		assert.equal(state.displayAgent, "pi [⏳ Exploring - Bash]");
 
 		// Bash tool ends -> agent is now thinking and should show active exploring phase
 		handlers.get("tool_execution_end")?.({ toolCallId: "call_1", toolName: "bash" }, ctx);
 		state = tracker.getDesiredState();
 		assert.equal(state.state, "working");
-		assert.equal(state.message, "[exploring]");
-		assert.equal(state.displayAgent, "pi [⏳ exploring]");
+		assert.equal(state.message, "Exploring");
+		assert.equal(state.displayAgent, "pi [⏳ Exploring]");
 
 		// Agent settles -> should show [success]
 		handlers.get("agent_settled")?.({}, { ...ctx, isIdle: () => true });
@@ -594,14 +664,14 @@ describe("HerdrTracker socket communication", () => {
 		// Working state without 'pi ' prefix
 		let state = tracker.getDesiredState();
 		assert.equal(state.state, "working");
-		assert.equal(state.message, "[pensando]");
-		assert.equal(state.displayAgent, "[⏳ pensando]");
+		assert.equal(state.message, "Working");
+		assert.equal(state.displayAgent, "[⏳ Working]");
 
 		// Tool running
 		handlers.get("tool_execution_start")?.({ toolCallId: "call_1", toolName: "read" }, {});
 		state = tracker.getDesiredState();
-		assert.equal(state.message, "[read]");
-		assert.equal(state.displayAgent, "[⏳ read]");
+		assert.equal(state.message, "Working - Read");
+		assert.equal(state.displayAgent, "[⏳ Working - Read]");
 
 		// Success
 		handlers.get("agent_settled")?.({}, { isIdle: () => true });
