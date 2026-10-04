@@ -8,6 +8,8 @@ import { DEFAULT_CONFIG, saveConfig } from "../lib/config.ts";
 const root = mkdtempSync(join(tmpdir(), "pi-notify-ext-"));
 process.env.PI_NOTIFY_CONFIG_HOME = root;
 process.env.PI_NOTIFY_DISABLE_SYSTEM_SPAWN = "1";
+const originalChildMarker = process.env.GENTLE_PI_AGENTS_CHILD;
+process.env.GENTLE_PI_AGENTS_CHILD = "";
 delete process.env.PI_NOTIFY_TELEGRAM_BOT_TOKEN;
 delete process.env.TELEGRAM_BOT_TOKEN;
 
@@ -72,6 +74,8 @@ before(async () => {
 
 after(() => {
 	globalThis.fetch = realFetch;
+	if (originalChildMarker === undefined) delete process.env.GENTLE_PI_AGENTS_CHILD;
+	else process.env.GENTLE_PI_AGENTS_CHILD = originalChildMarker;
 	rmSync(root, { recursive: true, force: true });
 });
 
@@ -431,6 +435,18 @@ describe("telegram-notify extension", () => {
 		assert.match(text, /Task finished — team-alpha — test-session/);
 		assert.doesNotMatch(text, /my-project/);
 		assert.doesNotMatch(text, /—\s*—/);
+	});
+});
+
+describe("main-only terminal result ownership", () => {
+	it("does not notify for gentle-agents.result while preserving parent result consumption", async () => {
+		saveConfig({ ...DEFAULT_CONFIG, botToken: "123:token", chatIds: ["10"], events: ["agent_settled"] }, process.env);
+		sent.length = 0;
+		const pi = fakePi();
+		register(pi);
+		await pi.emit("message_end", { message: { customType: "gentle-agents.result", details: { gentleAgents: { taskId: "child-task" } } } }, ctx);
+		await pi.emit("session_shutdown", { type: "session_shutdown" }, ctx);
+		assert.deepEqual(sent, []);
 	});
 });
 

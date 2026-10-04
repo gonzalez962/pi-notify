@@ -10,6 +10,8 @@ import { resetSystemDrivers, setSystemDrivers } from "../extensions/telegram-not
 const root = mkdtempSync(join(tmpdir(), "pi-channel-iso-"));
 process.env.PI_NOTIFY_CONFIG_HOME = root;
 process.env.PI_NOTIFY_DISABLE_SYSTEM_SPAWN = "1";
+const originalChildMarker = process.env.GENTLE_PI_AGENTS_CHILD;
+process.env.GENTLE_PI_AGENTS_CHILD = "";
 
 interface FakePi {
 	handlers: Map<string, Array<(event: unknown, ctx: unknown) => unknown>>;
@@ -80,6 +82,8 @@ before(async () => {
 
 after(() => {
 	resetSystemDrivers();
+	if (originalChildMarker === undefined) delete process.env.GENTLE_PI_AGENTS_CHILD;
+	else process.env.GENTLE_PI_AGENTS_CHILD = originalChildMarker;
 	rmSync(root, { recursive: true, force: true });
 });
 
@@ -92,7 +96,7 @@ beforeEach(() => {
 	terminalFocused = false;
 });
 
-describe("channel isolation and edge cases", () => {
+describe("channel isolation and edge cases", { concurrency: 1 }, () => {
 	const ctx = {
 		mode: "tui",
 		cwd: join(root, "project-alpha"),
@@ -275,7 +279,62 @@ describe("channel isolation and edge cases", () => {
 		assert.equal(systemSounds.some((s) => s.ev === "complete"), false);
 	});
 
-	it("dispatches subagent_complete alert on message_end with gentle-agents.result", async () => {
+	it("suppresses child-marked completion, error, cancellation, and result notifications in every enabled channel", async () => {
+		const originalMarker = process.env.GENTLE_PI_AGENTS_CHILD;
+		process.env.GENTLE_PI_AGENTS_CHILD = "1";
+		try {
+			saveConfig({ ...DEFAULT_CONFIG, enabled: true, botToken: "123:token", chatIds: ["100"], events: ["agent_settled", "session_compact_failed"] });
+			saveSystemConfig({
+				...DEFAULT_SYSTEM_CONFIG,
+				enabled: true,
+				events: {
+					...DEFAULT_SYSTEM_CONFIG.events,
+					user_cancelled: { notification: true, sound: true, bell: true, command: true },
+				},
+			});
+			const pi = fakePi();
+			register(pi);
+			await pi.emit("agent_settled", {}, ctx);
+			await pi.emit("session_compact_failed", { reason: "child error" }, ctx);
+			await pi.emit("agent_end", { messages: [{ role: "assistant", stopReason: "aborted" }] }, ctx);
+			await pi.emit("message_end", { message: { customType: "gentle-agents.result", details: { gentleAgents: { taskId: "child" } } } }, ctx);
+			await pi.emit("session_shutdown", {}, ctx);
+			assert.equal(sentTelegram.length, 0);
+			assert.equal(systemNotifications.length, 0);
+			assert.equal(systemSounds.length, 0);
+			assert.equal(systemBells.length, 0);
+			assert.equal(systemCommands.length, 0);
+		} finally {
+			if (originalMarker === undefined) delete process.env.GENTLE_PI_AGENTS_CHILD;
+			else process.env.GENTLE_PI_AGENTS_CHILD = originalMarker;
+		}
+	});
+
+	it("retains main-producer completion, error, and cancellation notifications", async () => {
+		process.env.GENTLE_PI_AGENTS_CHILD = "";
+		saveConfig({ ...DEFAULT_CONFIG, enabled: true, botToken: "123:token", chatIds: ["100"], events: ["agent_settled", "session_compact_failed"] });
+		saveSystemConfig({
+			...DEFAULT_SYSTEM_CONFIG,
+			enabled: true,
+			minDuration: 0,
+			events: {
+				...DEFAULT_SYSTEM_CONFIG.events,
+				user_cancelled: { notification: true, sound: true, bell: true, command: true },
+			},
+		});
+		const pi = fakePi();
+		register(pi);
+		await pi.emit("agent_settled", {}, ctx);
+		await pi.emit("session_compact_failed", { reason: "main error" }, ctx);
+		await pi.emit("agent_end", { messages: [{ role: "assistant", stopReason: "aborted" }] }, ctx);
+		await pi.emit("session_shutdown", {}, ctx);
+		assert.equal(sentTelegram.length, 2);
+		assert.ok(systemNotifications.some((n) => n.message.includes("Session has finished")));
+		assert.ok(systemNotifications.some((n) => n.message.includes("Session encountered an error")));
+		assert.ok(systemNotifications.some((n) => n.message.includes("cancelled by user")));
+	});
+
+	it("does not notify for parent gentle-agents.result activity", async () => {
 		saveSystemConfig({
 			...DEFAULT_SYSTEM_CONFIG,
 			enabled: true,
@@ -295,10 +354,9 @@ describe("channel isolation and edge cases", () => {
 			},
 		}, ctx);
 
-		assert.equal(systemNotifications.length, 1);
-		assert.ok(systemNotifications[0].message.includes("Subagent task completed"));
-		assert.equal(systemSounds.length, 1);
-		assert.equal(systemSounds[0].ev, "subagent_complete");
+		assert.equal(sentTelegram.length, 0);
+		assert.equal(systemNotifications.length, 0);
+		assert.equal(systemSounds.length, 0);
 	});
 
 	it("bypasses focus suppression when running /notify test", async () => {

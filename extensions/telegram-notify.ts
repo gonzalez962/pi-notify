@@ -69,6 +69,7 @@ export function resetSystemDrivers(): void {
 }
 
 export default function telegramNotify(pi: ExtensionAPI): void {
+	const isChildProducer = process.env.GENTLE_PI_AGENTS_CHILD === "1";
 	let config: NotifyConfig = loadConfig();
 	let systemConfig: SystemConfig = loadSystemConfig();
 	const herdrTracker = initHerdrTracker(pi, {
@@ -150,6 +151,7 @@ export default function telegramNotify(pi: ExtensionAPI): void {
 		event: unknown,
 		ctx: ExtensionContext,
 	): Promise<void> {
+		if (isChildProducer) return;
 		if (!config.enabled || !config.events.includes(eventName)) return;
 		if (validateForSend(config, resolveBotToken(config)).length > 0) return;
 		if (throttled(eventName, Date.now())) return;
@@ -184,6 +186,7 @@ export default function telegramNotify(pi: ExtensionAPI): void {
 		ctx?: ExtensionContext,
 		options: { bypassFocus?: boolean } = {},
 	): Promise<void> {
+		if (isChildProducer) return;
 		if (!systemConfig.enabled) return;
 
 		// Restrict to interactive TUI session by default so subagents stay quiet.
@@ -292,13 +295,6 @@ export default function telegramNotify(pi: ExtensionAPI): void {
 		return undefined;
 	});
 
-	pi.on("message_end", (event: unknown, ctx: ExtensionContext) => {
-		const msg = (event as { message?: any } | undefined)?.message;
-		if (msg?.customType === "gentle-agents.result") {
-			track(dispatchSystemEvent("subagent_complete", event, ctx).catch(() => undefined));
-		}
-		return undefined;
-	});
 
 	for (const eventName of SUPPORTED_EVENTS) {
 		pi.on(eventName, (event: unknown, ctx: ExtensionContext) => {
