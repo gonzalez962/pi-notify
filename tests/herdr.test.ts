@@ -49,6 +49,7 @@ describe("Herdr helper functions", () => {
 
 		assert.equal(isHerdrActivePane({} as any), null);
 	});
+
 	it("uses the focused flag because pane current always returns the caller pane", () => {
 		const env = { HERDR_ENV: "1", HERDR_PANE_ID: "w4:p1" } as any;
 		const ownPane = (focused: boolean) => () =>
@@ -715,6 +716,127 @@ describe("HerdrTracker socket communication", () => {
 		const metaReport = sentRequests.find((r) => r.method === "pane.report_metadata");
 		assert.ok(metaReport);
 		assert.equal(metaReport.params.display_agent, "pi [⏳ Working - Bash]");
+	});
+
+	it("does not publish queued metadata after dispose while agent IPC is delayed", async () => {
+		const sent: any[] = [];
+		let releaseAgent!: () => void;
+		let agentStarted!: () => void;
+		const started = new Promise<void>((resolve) => { agentStarted = resolve; });
+		const tracker = new HerdrTracker({
+			env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: "test.sock", HERDR_PANE_ID: "w1:p1" },
+			sendRequest: async (_endpoint, request) => {
+				sent.push(request);
+				if (request.method === "pane.report_agent") {
+					agentStarted();
+					await new Promise<void>((resolve) => { releaseAgent = resolve; });
+				}
+				return true;
+			},
+			writeStdout: () => {},
+		});
+		const handlers = new Map<string, any>();
+		tracker.wirePiEvents({ on: (name: string, cb: any) => handlers.set(name, cb), events: { on: () => {} } });
+		handlers.get("agent_start")?.();
+		handlers.get("tool_execution_start")?.({ toolName: "bash" });
+		await started;
+		assert.equal(sent.some((request) => request.method === "pane.report_agent"), true, "report_agent reached the held sender before dispose");
+		tracker.dispose();
+		releaseAgent();
+		await new Promise((resolve) => setTimeout(resolve, 20));
+
+		const metadata = sent.filter((request) => request.method === "pane.report_metadata");
+		assert.equal(metadata.length, 1);
+		assert.equal(metadata[0].params.clear_display_agent, true);
+	});
+
+	it("clears branch metadata on dispose and ignores a late branch resolution", async () => {
+		const sent: any[] = [];
+		let resolveBranch!: (branch: string | undefined) => void;
+		let resolutions = 0;
+		const tracker = new HerdrTracker({
+			env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: "test.sock", HERDR_PANE_ID: "w1:p1" },
+			resolveBranch: () => ++resolutions === 1
+				? Promise.resolve("current-branch")
+				: new Promise((resolve) => { resolveBranch = resolve; }),
+			sendRequest: async (_endpoint, request) => { sent.push(request); return true; },
+			writeStdout: () => {},
+		});
+		const handlers = new Map<string, any>();
+		tracker.wirePiEvents({ on: (name: string, cb: any) => handlers.set(name, cb), events: { on: () => {} } });
+		handlers.get("agent_start")?.({}, { cwd: process.cwd() });
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		handlers.get("agent_start")?.({}, { cwd: process.cwd() });
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		tracker.dispose();
+		resolveBranch("late-branch");
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		const metadata = sent.filter((request) => request.method === "pane.report_metadata");
+		const cleared = metadata.find((request) => request.params.clear_title && request.params.clear_display_agent);
+		assert.ok(cleared);
+		assert.equal(cleared.params.tokens.branch, "");
+		assert.equal(metadata.some((request) => request.params.tokens?.branch === "late-branch"), false);
+	});
+
+	it("clears old branch immediately when cwd changes, even if the new directory is unavailable", async () => {
+		const sent: any[] = [];
+		let currentBranch: string | undefined = "old-branch";
+		let deferNewCwd = false;
+		const tracker = new HerdrTracker({
+			env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: "test.sock", HERDR_PANE_ID: "w1:p1" },
+			resolveBranch: async (cwd) => {
+				if (cwd === "unavailable-new-cwd" && deferNewCwd) return new Promise(() => {});
+				return currentBranch;
+			},
+			sendRequest: async (_endpoint, request) => { sent.push(request); return true; },
+			writeStdout: () => {},
+		});
+		const handlers = new Map<string, any>();
+		tracker.wirePiEvents({ on: (name: string, cb: any) => handlers.set(name, cb), events: { on: () => {} } });
+		const initialCwd = "existing-cwd";
+		handlers.get("agent_start")?.({}, { cwd: initialCwd });
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.ok(sent.some((request) => request.method === "pane.report_metadata" && request.params.tokens?.branch === "old-branch"));
+
+		const before = sent.filter((request) => request.method === "pane.report_metadata").length;
+		currentBranch = undefined;
+		deferNewCwd = true;
+		handlers.get("agent_start")?.({}, { cwd: "unavailable-new-cwd" });
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		const metadata = sent.filter((request) => request.method === "pane.report_metadata");
+		assert.ok(metadata.length > before);
+		assert.equal(metadata.at(-1)?.params.tokens?.branch ?? "", "");
+		tracker.dispose();
+	});
+
+	it("reports branch token and refreshes it when the branch changes without state changes", async () => {
+		const sent: any[] = [];
+		let branch: string | undefined = "feat/one";
+		const tracker = new HerdrTracker({
+			env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: "test.sock", HERDR_PANE_ID: "w1:p1" },
+			resolveBranch: async (cwd) => { assert.equal(cwd, process.cwd()); return branch; },
+			sendRequest: async (_endpoint, request) => { sent.push(request); return true; },
+			writeStdout: () => {},
+		});
+		const handlers = new Map<string, any>();
+		tracker.wirePiEvents({ on: (name: string, cb: any) => handlers.set(name, cb), events: { on: () => {} } });
+		handlers.get("agent_start")?.({}, { cwd: process.cwd() });
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.ok(sent.some((request) => request.method === "pane.report_metadata" && request.params.tokens.branch === "feat/one"));
+
+		const before = sent.filter((request) => request.method === "pane.report_metadata").length;
+		branch = "feat/two";
+		handlers.get("agent_start")?.({}, { cwd: process.cwd() });
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		const metadata = sent.filter((request) => request.method === "pane.report_metadata");
+		assert.ok(metadata.length > before);
+		assert.equal(metadata.at(-1)?.params.tokens.branch, "feat/two");
+
+		branch = undefined;
+		handlers.get("agent_start")?.({}, { cwd: process.cwd() });
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		const cleared = sent.filter((request) => request.method === "pane.report_metadata");
+		assert.equal(cleared.at(-1)?.params.tokens.branch, "");
 	});
 
 	it("formats thinking state when agent starts without a tool", () => {

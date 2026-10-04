@@ -1,5 +1,6 @@
 import net from "node:net";
 import path from "node:path";
+import { resolveHerdrBranch } from "./herdr-branch.ts";
 
 // Windows Terminal / ConEmu OSC 9;4 progress sequences
 export const WT_PROGRESS_WORKING = "\x1b]9;4;3\x07";
@@ -74,6 +75,7 @@ export interface HerdrTrackerOptions {
 	writeStdout?: (chunk: string) => void;
 	writeDiagnostic?: (line: string) => void;
 	sendRequest?: (endpoint: string, request: unknown, timeoutMs?: number) => Promise<boolean>;
+	resolveBranch?: (cwd: string) => Promise<string | undefined>;
 	showAgentPrefix?: boolean;
 }
 
@@ -122,6 +124,10 @@ export class HerdrTracker {
 	private platform: string;
 	private writeStdout: (chunk: string) => void;
 	private sendRequestFn: (endpoint: string, request: unknown, timeoutMs?: number) => Promise<boolean>;
+	private resolveBranchFn: (cwd: string) => Promise<string | undefined>;
+	private branchCwd = process.cwd();
+	private branch: string | undefined;
+	private branchRefresh: Promise<void> | undefined;
 	private showAgentPrefix: boolean;
 	private writeDiagnostic: (line: string) => void;
 	private diagnosticsEnabled: boolean;
@@ -142,6 +148,7 @@ export class HerdrTracker {
 	private retryTimers: NodeJS.Timeout[] = [];
 	private keepaliveTimer: NodeJS.Timeout | null = null;
 	private phaseRefreshTimer: NodeJS.Timeout | null = null;
+	private branchRefreshTimer: NodeJS.Timeout | null = null;
 
 	private lastReportedState: HerdrAgentState | undefined;
 	private lastReportedMessage: string | undefined;
@@ -171,6 +178,7 @@ export class HerdrTracker {
 			} catch {}
 		});
 		this.sendRequestFn = options.sendRequest ?? sendHerdrRequestDefault;
+		this.resolveBranchFn = options.resolveBranch ?? resolveHerdrBranch;
 		this.showAgentPrefix = options.showAgentPrefix ?? true;
 		this.diagnosticsEnabled = this.env.PI_NOTIFY_HERDR_DIAGNOSTICS === "1";
 		this.isChildProducer = this.env.GENTLE_PI_AGENTS_CHILD === "1";
@@ -437,6 +445,10 @@ export class HerdrTracker {
 		this.sendInFlight = true;
 		try {
 			while (this.queuedState) {
+				if (this.isDisposed) {
+					this.queuedState = undefined;
+					break;
+				}
 				const next = this.queuedState;
 				this.queuedState = undefined;
 				const paneId = this.env.HERDR_PANE_ID!;
@@ -455,7 +467,7 @@ export class HerdrTracker {
 						seq: next.seq,
 					},
 				});
-
+				if (this.isDisposed) break;
 				// 2. Report metadata (display_agent, title, tokens)
 				if (next.clearDisplayAgent) {
 					await this.executeSend({
@@ -483,6 +495,7 @@ export class HerdrTracker {
 							tokens: {
 								subagents: String(this.activeSubagents.size),
 								tool: this.currentToolName ?? undefined,
+								branch: this.branch ?? "",
 							},
 							seq: this.nextReportSeq(),
 						},
@@ -491,10 +504,34 @@ export class HerdrTracker {
 			}
 		} finally {
 			this.sendInFlight = false;
-			if (this.queuedState) {
+			if (!this.isDisposed && this.queuedState) {
 				void this.drainQueue();
 			}
 		}
+	}
+
+	private refreshBranch(): void {
+		if (!this.isHerdrEnvironment() || this.branchRefresh) return;
+		const cwd = this.branchCwd;
+		this.branchRefresh = Promise.resolve()
+			.then(() => this.resolveBranchFn(cwd))
+			.then((branch) => {
+				if (cwd !== this.branchCwd || this.isDisposed) return;
+				if (branch !== this.branch) {
+					this.branch = branch;
+					this.publishState(true);
+				}
+			})
+			.catch(() => {
+				if (cwd === this.branchCwd && this.branch !== undefined) {
+					this.branch = undefined;
+					this.publishState(true);
+				}
+			})
+			.finally(() => {
+				this.branchRefresh = undefined;
+				if (cwd !== this.branchCwd && !this.isDisposed) this.refreshBranch();
+			});
 	}
 
 	public publishState(force = false): void {
@@ -507,6 +544,11 @@ export class HerdrTracker {
 			blockers: this.activeBlockers.size,
 		});
 		const displayChanged = next.displayAgent !== this.lastReportedDisplayAgent;
+		this.refreshBranch();
+		if (this.isHerdrEnvironment() && this.branchRefreshTimer === null) {
+			this.branchRefreshTimer = setInterval(() => this.refreshBranch(), 2_000);
+			this.branchRefreshTimer.unref?.();
+		}
 
 		if (
 			!force &&
@@ -702,16 +744,24 @@ export class HerdrTracker {
 
 		pi.on("before_agent_start", (_event: unknown, ctx: any) => {
 			updateSessionFromCtx(ctx);
+			this.branchCwd = typeof ctx?.cwd === "string" ? ctx.cwd : process.cwd();
+			this.branch = undefined;
+			this.refreshBranch();
 			this.hasRunTask = true;
 			this.isMainAgentWorking = true;
 			this.lastFatalError = false;
 			this.activeBlockers.clear();
 			this.activeBlockerMessages.clear();
 			this.clearTimers();
-			this.publishState();
+			this.publishState(true);
 		});
 
 		pi.on("agent_start", (_event: unknown, ctx: any) => {
+			const cwdChanged = typeof ctx?.cwd === "string" && ctx.cwd !== this.branchCwd;
+			if (cwdChanged) {
+				this.branchCwd = ctx.cwd;
+				this.branch = undefined;
+			}
 			this.hasRunTask = true;
 			this.isMainAgentWorking = true;
 			this.lastFatalError = false;
@@ -719,7 +769,7 @@ export class HerdrTracker {
 			this.activeBlockers.clear();
 			this.activeBlockerMessages.clear();
 			this.clearTimers();
-			this.publishState();
+			this.publishState(cwdChanged);
 		});
 
 		pi.on("turn_start", (_event: unknown, ctx: any) => {
@@ -881,6 +931,7 @@ export class HerdrTracker {
 
 	public dispose(): void {
 		this.isDisposed = true;
+		this.queuedState = undefined;
 		this.isMainAgentWorking = false;
 		this.currentToolName = null;
 		this.currentActivityNotice = null;
@@ -889,6 +940,10 @@ export class HerdrTracker {
 		this.activeBlockers.clear();
 		this.activeBlockerMessages.clear();
 		this.clearTimers();
+		if (this.branchRefreshTimer !== null) {
+			clearInterval(this.branchRefreshTimer);
+			this.branchRefreshTimer = null;
+		}
 		this.emitTerminalTitle(undefined, "idle");
 		if (this.isHerdrEnvironment() && this.lastReportedDisplayAgent) {
 			const paneId = this.env.HERDR_PANE_ID!;
@@ -902,6 +957,7 @@ export class HerdrTracker {
 					agent: "pi",
 					clear_display_agent: true,
 					clear_title: true,
+					tokens: { branch: "" },
 					seq: this.nextReportSeq(),
 				},
 			});
