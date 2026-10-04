@@ -97,6 +97,10 @@ export function isHerdrActivePane(
 	if (!out) return null;
 	try {
 		const data = JSON.parse(out);
+		const pane = data?.result?.pane ?? data?.pane;
+		// `pane current` resolves the caller's pane, so its id always matches;
+		// only the `focused` flag tells whether the user is looking at it.
+		if (typeof pane?.focused === "boolean") return pane.focused;
 		const focusedPaneId = data?.result?.pane?.pane_id || data?.pane?.pane_id || data?.pane_id;
 		if (focusedPaneId) {
 			return String(focusedPaneId) === String(env.HERDR_PANE_ID);

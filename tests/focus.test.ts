@@ -128,8 +128,8 @@ describe("focus detection", () => {
 		const env = { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" } as any;
 		const mockExec = (cmd: string) => {
 			if (cmd.includes("herdr pane current")) {
-				// User switched to another pane in Herdr
-				return JSON.stringify({ result: { pane: { pane_id: "w1:p2", focused: true } } });
+				// User switched to another pane: pane current still returns the caller pane, unfocused
+				return JSON.stringify({ result: { pane: { pane_id: "w1:p1", focused: false } } });
 			}
 			return null;
 		};

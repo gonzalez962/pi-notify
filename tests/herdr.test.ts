@@ -49,6 +49,13 @@ describe("Herdr helper functions", () => {
 
 		assert.equal(isHerdrActivePane({} as any), null);
 	});
+	it("uses the focused flag because pane current always returns the caller pane", () => {
+		const env = { HERDR_ENV: "1", HERDR_PANE_ID: "w4:p1" } as any;
+		const ownPane = (focused: boolean) => () =>
+			JSON.stringify({ result: { pane: { pane_id: "w4:p1", focused } } });
+		assert.equal(isHerdrActivePane(env, ownPane(false)), false);
+		assert.equal(isHerdrActivePane(env, ownPane(true)), true);
+	});
 });
 
 describe("HerdrTracker process formatting and states", () => {
