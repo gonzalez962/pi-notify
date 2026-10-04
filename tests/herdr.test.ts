@@ -735,6 +735,31 @@ describe("HerdrTracker socket communication", () => {
 		assert.equal(state.displayAgent, "pi [⏳ Working]");
 	});
 
+	it("child producer marker prevents lifecycle hooks from publishing Herdr titles or pane results", async () => {
+		const writes: string[] = [];
+		const sent: unknown[] = [];
+		const tracker = new HerdrTracker({
+			env: {
+				GENTLE_PI_AGENTS_CHILD: "1",
+				HERDR_ENV: "1",
+				HERDR_SOCKET_PATH: "test.sock",
+				HERDR_PANE_ID: "w1:p1",
+			},
+			writeStdout: (chunk) => writes.push(chunk),
+			sendRequest: async (_endpoint, request) => { sent.push(request); return true; },
+		});
+		const handlers = new Map<string, any>();
+		tracker.wirePiEvents({ on: (name: string, cb: any) => handlers.set(name, cb), events: { on: () => {} } });
+		handlers.get("session_start")?.({}, {});
+		handlers.get("agent_start")?.();
+		handlers.get("agent_end")?.({ messages: [{ stopReason: "error" }] });
+		handlers.get("agent_settled")?.({}, { isIdle: () => true });
+		handlers.get("session_shutdown")?.();
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.deepEqual(writes, []);
+		assert.deepEqual(sent, []);
+	});
+
 	it("formats fatal error on agent_end stopReason", () => {
 		const tracker = new HerdrTracker();
 		const handlers = new Map<string, any>();
@@ -760,6 +785,7 @@ describe("HerdrTracker socket communication", () => {
 	it("emits terminal titles matching PowerShell indicators", () => {
 		let lastWritten = "";
 		const tracker = new HerdrTracker({
+			env: {},
 			writeStdout: (chunk) => {
 				lastWritten = chunk;
 			},

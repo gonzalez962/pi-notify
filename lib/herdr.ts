@@ -125,6 +125,7 @@ export class HerdrTracker {
 	private showAgentPrefix: boolean;
 	private writeDiagnostic: (line: string) => void;
 	private diagnosticsEnabled: boolean;
+	private readonly isChildProducer: boolean;
 	private diagnosticLines = 0;
 
 	private isDisposed = false;
@@ -172,6 +173,7 @@ export class HerdrTracker {
 		this.sendRequestFn = options.sendRequest ?? sendHerdrRequestDefault;
 		this.showAgentPrefix = options.showAgentPrefix ?? true;
 		this.diagnosticsEnabled = this.env.PI_NOTIFY_HERDR_DIAGNOSTICS === "1";
+		this.isChildProducer = this.env.GENTLE_PI_AGENTS_CHILD === "1";
 		this.writeDiagnostic = options.writeDiagnostic ?? ((line) => { process.stderr.write(`${line}\n`); });
 	}
 
@@ -339,6 +341,7 @@ export class HerdrTracker {
 	}
 
 	public emitTerminalTitle(desc?: string, state: HerdrAgentState = "idle"): void {
+		if (this.isChildProducer) return;
 		const base = this.getBaseTitle();
 		let title = base;
 		let progressSeq = WT_PROGRESS_CLEAR;
@@ -495,7 +498,7 @@ export class HerdrTracker {
 	}
 
 	public publishState(force = false): void {
-		if (this.isDisposed) return;
+		if (this.isDisposed || this.isChildProducer) return;
 		const next = this.getDesiredState();
 		this.diagnostic("desired_state", {
 			state: next.state,
