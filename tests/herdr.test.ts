@@ -435,6 +435,198 @@ describe("HerdrTracker process formatting and states", () => {
 		handlers.get("agent_settled")?.({}, { isIdle: () => true });
 		assert.equal(tracker.getDesiredState().state, "idle");
 	});
+
+	it("keeps working state and formats background jobs when main agent settles", () => {
+		const tracker = new HerdrTracker();
+		const handlers = new Map<string, any>();
+		const events = new Map<string, any>();
+		tracker.wirePiEvents({
+			on: (name: string, cb: any) => handlers.set(name, cb),
+			events: { on: (name: string, cb: any) => events.set(name, cb) },
+		});
+		handlers.get("agent_start")?.();
+
+		// Background job is running
+		events.get("gentle-ai:jobs-sidebar")?.({
+			snapshot: {
+				jobs: [{ id: "job-1", label: "CI build", startedAt: Date.now() }],
+			},
+		});
+
+		// Main agent settles while background job is still running
+		handlers.get("agent_settled")?.({}, { isIdle: () => true });
+
+		const state = tracker.getDesiredState();
+		assert.equal(state.state, "working", "must not mark as idle while jobs run");
+		assert.notEqual(state.message, "[success]", "must not mark as success while jobs run");
+		assert.equal(state.message, "Working - Job: CI build");
+		assert.equal(state.displayAgent, "pi [⏳ Working - Job: CI build]");
+
+		// When job finishes and snapshot is empty
+		events.get("gentle-ai:jobs-sidebar")?.({
+			snapshot: { jobs: [] },
+		});
+
+		const settledState = tracker.getDesiredState();
+		assert.equal(settledState.state, "idle");
+		assert.equal(settledState.message, "[success]");
+		assert.equal(settledState.displayAgent, "pi [✅ success]");
+	});
+
+	it("formats multiple background jobs and combinations with tools and subagents", () => {
+		const tracker = new HerdrTracker();
+		const handlers = new Map<string, any>();
+		const events = new Map<string, any>();
+		tracker.wirePiEvents({
+			on: (name: string, cb: any) => handlers.set(name, cb),
+			events: { on: (name: string, cb: any) => events.set(name, cb) },
+		});
+		handlers.get("agent_start")?.();
+
+		// Multiple jobs
+		events.get("gentle-ai:jobs-sidebar")?.({
+			snapshot: {
+				jobs: [
+					{ id: "j1", label: "test", startedAt: 1 },
+					{ id: "j2", label: "lint", startedAt: 2 },
+				],
+			},
+		});
+		assert.equal(tracker.getDesiredState().message, "Working - 2 jobs");
+
+		// Combined with active tool
+		handlers.get("tool_execution_start")?.({ toolCallId: "t1", toolName: "read" });
+		assert.equal(tracker.getDesiredState().message, "Working - Read/2 jobs");
+
+		// Combined with tool and subagent
+		events.get("gentle-agents:activity")?.({
+			tasks: [{ id: "sub1", agent: "gentle-ai-worker", status: "running" }],
+		});
+		assert.equal(tracker.getDesiredState().message, "Working - Read/Gentle-ai-worker/2 jobs");
+
+		handlers.get("tool_execution_end")?.({ toolCallId: "t1", toolName: "read" });
+		assert.equal(tracker.getDesiredState().message, "Working - Gentle-ai-worker/2 jobs");
+	});
+
+	it("tracks background jobs from bash_background tool execution and job notices", () => {
+		const tracker = new HerdrTracker();
+		const handlers = new Map<string, any>();
+		tracker.wirePiEvents({
+			on: (name: string, cb: any) => handlers.set(name, cb),
+			events: { on: () => {} },
+		});
+		handlers.get("agent_start")?.();
+
+		// bash_background tool starts a job
+		handlers.get("tool_execution_end")?.({
+			toolName: "bash_background",
+			result: {
+				details: {
+					gentleJobs: { id: "job-42", label: "watch CI", status: "running" },
+				},
+			},
+		});
+
+		// Main agent settles
+		handlers.get("agent_settled")?.({}, { isIdle: () => true });
+		assert.equal(tracker.getDesiredState().state, "working");
+		assert.equal(tracker.getDesiredState().message, "Working - Job: watch CI");
+
+		// Job exit notice arrives via message_end
+		handlers.get("message_end")?.({
+			message: {
+				customType: "gentle-jobs.notice",
+				details: { gentleJobs: { id: "job-42" } },
+			},
+		});
+
+		assert.equal(tracker.getDesiredState().state, "idle");
+		assert.equal(tracker.getDesiredState().message, "[success]");
+	});
+
+	it("tracks background jobs from string count and job_stop", () => {
+		const tracker = new HerdrTracker();
+		const handlers = new Map<string, any>();
+		const events = new Map<string, any>();
+		tracker.wirePiEvents({
+			on: (name: string, cb: any) => handlers.set(name, cb),
+			events: { on: (name: string, cb: any) => events.set(name, cb) },
+		});
+		handlers.get("agent_start")?.();
+
+		// Status string event e.g. "⧗ 2 jobs"
+		events.get("jobs:activity")?.("⧗ 2 jobs");
+		assert.equal(tracker.getDesiredState().message, "Working - 2 jobs");
+
+		// job_stop stops one job
+		handlers.get("tool_execution_end")?.({
+			toolName: "job_stop",
+			result: {
+				details: { gentleJobs: { id: "job-1" } },
+			},
+		});
+		assert.equal(tracker.getDesiredState().message, "Working - 1 job");
+	});
+
+	it("ignores background jobs from a different session when sessionId is provided", () => {
+		const tracker = new HerdrTracker();
+		const handlers = new Map<string, any>();
+		const events = new Map<string, any>();
+		tracker.wirePiEvents({
+			on: (name: string, cb: any) => handlers.set(name, cb),
+			events: { on: (name: string, cb: any) => events.set(name, cb) },
+		});
+		handlers.get("session_start")?.({}, { sessionId: "session-a" });
+		handlers.get("agent_start")?.({}, { sessionId: "session-a" });
+
+		// Event from session-b should be ignored
+		events.get("gentle-ai:jobs-sidebar")?.({
+			sessionId: "session-b",
+			snapshot: {
+				jobs: [{ id: "job-ext", label: "external", startedAt: 1 }],
+			},
+		});
+		assert.equal(tracker.getActiveJobs().length, 0);
+
+		// Event from matching session-a should be accepted
+		events.get("gentle-ai:jobs-sidebar")?.({
+			sessionId: "session-a",
+			snapshot: {
+				jobs: [{ id: "job-a", label: "own job", startedAt: 1 }],
+			},
+		});
+		assert.equal(tracker.getActiveJobs().length, 1);
+		assert.equal(tracker.getDesiredState().message, "Working - Job: own job");
+	});
+
+	it("tracks background jobs from monitor tool execution and regex text parsing", () => {
+		const tracker = new HerdrTracker();
+		const handlers = new Map<string, any>();
+		tracker.wirePiEvents({
+			on: (name: string, cb: any) => handlers.set(name, cb),
+			events: { on: () => {} },
+		});
+		handlers.get("agent_start")?.();
+
+		// monitor tool output with text content format
+		handlers.get("tool_execution_end")?.({
+			toolName: "monitor",
+			result: {
+				content: [{ text: 'Started monitor "tail log" (mon-1) for up to 30s.' }],
+			},
+		});
+		assert.equal(tracker.getActiveJobs().length, 1);
+		assert.equal(tracker.getDesiredState().message, "Working - Job: tail log");
+
+		// Stopped via job_stop text output
+		handlers.get("tool_execution_end")?.({
+			toolName: "job_stop",
+			result: {
+				content: [{ text: 'Stopped "tail log" (mon-1).' }],
+			},
+		});
+		assert.equal(tracker.getActiveJobs().length, 0);
+	});
 });
 
 describe("HerdrTracker agent state matrix", () => {
