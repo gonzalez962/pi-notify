@@ -14,10 +14,10 @@ The user reports main idle marks everything success and later processes are invi
 - No commits, push, or PR without explicit user request. No work-unit commit produced because no fix exists.
 
 ## Tasks
-- [ ] T1 (blocked): Confirm lifecycle contract, reproduce success -> resumed activity with a deterministic regression, implement smallest evidence-backed fix if reproducible, and self-verify. Existing tests pass; no failing regression demonstrated.
+- [x] T1: Implement jobs tracking in HerdrTracker: prevent premature `[success]` status during background jobs (`bash_background`, `monitor`), surface active jobs in process message (`Working - Job: <label>` / `Working - <N> jobs`), and transition to `[success]` only when all jobs finish. Verified with 6 new deterministic regression tests.
 - [x] T2: Diagnostics diff independently re-verified PASS; 33 Herdr/199 full tests pass, diff check exit 0. Native assessment remained unassessable due untracked task file; independent high-risk fallback completed. Future lifecycle fix requires fresh assessment/verification.
 - [x] T3: Disabled-by-default bounded redacted diagnostics implemented and independently verified. No commit: user has not requested one.
-- [ ] T4 (in_progress, awaiting live capture): Enable diagnostics in a new Pi host process and reproduce stale pane status to identify the failure boundary.
+- [x] T4: Stale pane status root cause identified: background jobs (`gentle-ai:jobs-sidebar` / `bash_background` / `monitor`) were not tracked in `HerdrTracker`, causing `agent_settled` to mark `[success]` prematurely while background jobs were running. Fixed and verified.
 
 ## Acceptance and checks
 Resumed main or background activity reports working after success; genuine completion still reports success; main settling does not hide known running tasks; queued report ordering is covered where relevant.

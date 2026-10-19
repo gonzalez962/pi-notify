@@ -22,6 +22,13 @@ export interface TrackedSubagent {
 	mode?: string;
 }
 
+export interface TrackedJob {
+	id: string;
+	label: string;
+	status?: string;
+	startedAt?: number;
+}
+
 const ODD_PHASE_REGISTRY = Symbol.for("gentle-pi.odd-phase-registry");
 
 export function getGentleOddPhase(sessionId?: string): string | undefined {
@@ -140,6 +147,7 @@ export class HerdrTracker {
 	private currentActivityNotice: string | null = null;
 	private activeToolCalls = new Map<string, string>();
 	private activeSubagents = new Map<string, TrackedSubagent>();
+	private activeJobs = new Map<string, TrackedJob>();
 	private activeBlockers = new Set<string>();
 	private activeBlockerMessages = new Map<string, string>();
 	private currentSessionId: string | undefined;
@@ -269,6 +277,10 @@ export class HerdrTracker {
 		return Array.from(this.activeSubagents.values());
 	}
 
+	public getActiveJobs(): TrackedJob[] {
+		return Array.from(this.activeJobs.values());
+	}
+
 	public getWaitingSubagent(): TrackedSubagent | undefined {
 		return Array.from(this.activeSubagents.values()).find(
 			(s) => s.status === "waiting" || (s.lastStep && s.lastStep.startsWith("asked")),
@@ -299,9 +311,19 @@ export class HerdrTracker {
 		}
 
 		const hasSub = this.activeSubagents.size > 0;
-		if (this.isMainAgentWorking || hasSub) {
+		const hasJobs = this.activeJobs.size > 0;
+		if (this.isMainAgentWorking || hasSub || hasJobs) {
 			const label = getGentlePromptLabel(this.getActiveSessionId());
-			const excluded = new Set(["subagent_run", "subagent", "gentle_odd_phase", "ask_user_choice", "ask_user_question"]);
+			const excluded = new Set([
+				"subagent_run",
+				"subagent",
+				"gentle_odd_phase",
+				"ask_user_choice",
+				"ask_user_question",
+				"bash_background",
+				"job_stop",
+				"job_list",
+			]);
 			const tools = this.activeToolCalls.size
 				? Array.from(new Set(this.activeToolCalls.values()))
 				: this.currentToolName ? [this.currentToolName] : [];
@@ -320,6 +342,22 @@ export class HerdrTracker {
 					suffixItems = [`${capitalize(subs[0]!.agent)}: ${step}`];
 				}
 			}
+
+			const jobs = Array.from(this.activeJobs.values());
+			if (jobs.length > 0) {
+				if (jobs.length === 1) {
+					const first = jobs[0]!;
+					const hasDistinctLabel = first.label && first.label !== first.id && !/^job(?:[- ]\d+)?$/i.test(first.label);
+					if (hasDistinctLabel && suffixItems.length === 0) {
+						suffixItems.push(`Job: ${first.label}`);
+					} else {
+						suffixItems.push("1 job");
+					}
+				} else {
+					suffixItems.push(`${jobs.length} jobs`);
+				}
+			}
+
 			if (suffixItems.length > 3) suffixItems = [...suffixItems.slice(0, 3), `+${suffixItems.length - 3}`];
 			const message = `${label}${suffixItems.length ? ` - ${suffixItems.join("/")}` : ""}`;
 			const display = this.formatDisplayAgent(`[⏳ ${message}]`);
@@ -541,6 +579,7 @@ export class HerdrTracker {
 			state: next.state,
 			activeTools: this.activeToolCalls.size,
 			activeSubagents: this.activeSubagents.size,
+			activeJobs: this.activeJobs.size,
 			blockers: this.activeBlockers.size,
 		});
 		const displayChanged = next.displayAgent !== this.lastReportedDisplayAgent;
@@ -626,6 +665,77 @@ export class HerdrTracker {
 		this.publishState();
 	}
 
+	public handleJobsActivity(data: unknown): void {
+		if (this.isDisposed) return;
+		const payload = data as {
+			sessionId?: string;
+			snapshot?: { jobs?: Array<{ id?: unknown; label?: unknown; status?: unknown; startedAt?: unknown }> };
+			jobs?: Array<{ id?: unknown; label?: unknown; status?: unknown; startedAt?: unknown }>;
+			count?: number;
+		} | undefined;
+		if (!payload) return;
+
+		const activeSessionId = this.getActiveSessionId();
+		if (payload.sessionId && activeSessionId && payload.sessionId !== activeSessionId) {
+			return;
+		}
+
+		const rawJobs = Array.isArray(payload.snapshot?.jobs)
+			? payload.snapshot!.jobs!
+			: Array.isArray(payload.jobs)
+			? payload.jobs
+			: undefined;
+
+		this.activeJobs.clear();
+
+		if (rawJobs) {
+			for (const j of rawJobs) {
+				const status = String(j.status ?? "running");
+				if (status === "running") {
+					const id = String(j.id ?? `job-${this.activeJobs.size + 1}`);
+					const label = String(j.label ?? id);
+					this.hasRunTask = true;
+					this.activeJobs.set(id, {
+						id,
+						label,
+						status,
+						startedAt: typeof j.startedAt === "number" ? j.startedAt : undefined,
+					});
+				}
+			}
+		} else if (typeof payload.count === "number") {
+			const count = Math.max(0, payload.count);
+			if (count > 0) {
+				this.hasRunTask = true;
+				for (let i = 1; i <= count; i++) {
+					this.activeJobs.set(`job-${i}`, {
+						id: `job-${i}`,
+						label: count === 1 ? "Job 1" : `Job ${i}`,
+						status: "running",
+					});
+				}
+			}
+		} else if (typeof data === "string") {
+			const match = data.match(/^[⧗⚡]?\s*(?:jobs?:\s*(\d+)|(\d+)\s+jobs?)$/iu);
+			if (match) {
+				const count = parseInt(match[1] ?? match[2]!, 10);
+				if (count > 0) {
+					this.hasRunTask = true;
+					for (let i = 1; i <= count; i++) {
+						this.activeJobs.set(`job-${i}`, {
+							id: `job-${i}`,
+							label: count === 1 ? "Job 1" : `Job ${i}`,
+							status: "running",
+						});
+					}
+				}
+			}
+		}
+
+		this.diagnostic("jobs_activity_received", { jobCount: this.activeJobs.size });
+		this.publishState();
+	}
+
 	public handleToolExecutionEnd(event: { toolName?: string; result?: any }): void {
 		if (this.isDisposed || !event?.toolName) return;
 		if (event.toolName === "subagent_run" || event.toolName === "subagent") {
@@ -663,6 +773,37 @@ export class HerdrTracker {
 				const taskId = match[1]?.replace(/[.:]$/, "")!;
 				this.activeSubagents.delete(taskId);
 			}
+		} else if (event.toolName === "bash_background" || event.toolName === "monitor") {
+			const details = event.result?.details?.gentleJobs;
+			if (details?.id) {
+				const id = String(details.id);
+				const label = String(details.label ?? details.command ?? id);
+				this.hasRunTask = true;
+				this.activeJobs.set(id, { id, label, status: "running" });
+			} else {
+				const content = Array.isArray(event.result?.content) ? event.result.content : [];
+				const text = content.map((c: any) => c?.text ?? "").join("\n");
+				const match = text.match(/Started (?:background job|monitor) (?:"([^"]+)" )?\(?([a-zA-Z0-9_-]+)\)?/i);
+				if (match) {
+					const label = match[1] || match[2]!;
+					const id = match[2]!;
+					this.hasRunTask = true;
+					this.activeJobs.set(id, { id, label, status: "running" });
+				}
+			}
+		} else if (event.toolName === "job_stop") {
+			const details = event.result?.details?.gentleJobs;
+			if (details?.id) {
+				this.activeJobs.delete(String(details.id));
+			} else {
+				const content = Array.isArray(event.result?.content) ? event.result.content : [];
+				const text = content.map((c: any) => c?.text ?? "").join("\n");
+				const match = text.match(/Stopped (?:"([^"]+)" )?\(?([a-zA-Z0-9_-]+)\)?/i);
+				if (match) {
+					const id = match[2] || match[1]!;
+					this.activeJobs.delete(id);
+				}
+			}
 		}
 	}
 
@@ -688,6 +829,9 @@ export class HerdrTracker {
 		if (pi.events?.on) {
 			pi.events.on("gentle-agents:activity", (data: unknown) => this.handleSubagentActivity(data));
 			pi.events.on("subagent:activity", (data: unknown) => this.handleSubagentActivity(data));
+			pi.events.on("gentle-ai:jobs-sidebar", (data: unknown) => this.handleJobsActivity(data));
+			pi.events.on("jobs:activity", (data: unknown) => this.handleJobsActivity(data));
+			pi.events.on("subagent:jobs", (data: unknown) => this.handleJobsActivity(data));
 			pi.events.on("herdr:blocked", (data: any) => {
 				if (!data?.active) {
 					this.activeBlockers.delete("herdr");
@@ -734,6 +878,7 @@ export class HerdrTracker {
 			updateSessionFromCtx(ctx);
 			this.activeToolCalls.clear();
 			this.activeSubagents.clear();
+			this.activeJobs.clear();
 			this.activeBlockers.clear();
 			this.activeBlockerMessages.clear();
 			this.lastFatalError = false;
@@ -898,6 +1043,20 @@ export class HerdrTracker {
 				this.isMainAgentWorking = true;
 				this.clearTimers();
 				this.publishState();
+			} else if (msg?.customType === "gentle-jobs.notice") {
+				const jobId = msg?.details?.gentleJobs?.id;
+				if (jobId && this.activeJobs.has(String(jobId))) {
+					this.activeJobs.delete(String(jobId));
+				} else {
+					const content = typeof msg?.content === "string" ? msg.content : Array.isArray(msg?.content) ? msg.content.map((c: any) => c?.text ?? "").join("\n") : "";
+					const match = content.match(/Background job (?:"([^"]+)" )?\(?([a-zA-Z0-9_-]+)\)? exited/i);
+					if (match) {
+						const id = match[2] || match[1]!;
+						this.activeJobs.delete(id);
+					}
+				}
+				this.hasRunTask = true;
+				this.publishState();
 			}
 		});
 
@@ -937,6 +1096,7 @@ export class HerdrTracker {
 		this.currentActivityNotice = null;
 		this.activeToolCalls.clear();
 		this.activeSubagents.clear();
+		this.activeJobs.clear();
 		this.activeBlockers.clear();
 		this.activeBlockerMessages.clear();
 		this.clearTimers();
