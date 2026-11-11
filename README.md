@@ -1,5 +1,7 @@
 # pi-notify
 
+![Pi Notify interface](images/pi-notify.png)
+
 Desktop system notifications (audio playback, desktop banners, terminal bell, custom commands) and Telegram alerts for [Pi](https://github.com/earendil-works/pi) agent hook events.
 
 It notifies the moments that actually need you — **the agent finished the task**, or **Pi is blocked asking you a question** — instead of streaming every turn and tool call into your screen or phone.
